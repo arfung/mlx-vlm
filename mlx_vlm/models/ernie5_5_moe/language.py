@@ -112,11 +112,46 @@ class MultiRouter(nn.Module):
         )
         self.top_k = config.num_experts_per_tok
         self.normalize = config.norm_topk_prob
+        # Both routers stacked in fp32, see _scores.
+        self._stacked_source = None
+        self._stacked = None
 
-    def __call__(self, x, bias):
+    def stacked(self):
+        """Both routers stacked in fp32, cast once.
+
+        The released routers are half precision and are scored in fp32, so the
+        plain form casts both and runs two products per call. Call this
+        outside compiled code: it evaluates the copy when the weights change.
+        """
+        source = (self.weight, self.weight_1)
+        cached = self._stacked_source
+        if cached is None or cached[0] is not source[0] or cached[1] is not source[1]:
+            self._stacked = mx.concatenate(
+                [w.astype(mx.float32) for w in source], axis=0
+            )
+            mx.eval(self._stacked)
+            self._stacked_source = source
+        return self._stacked
+
+    def _scores(self, x, stacked):
+        """Sum of the two routers' sigmoid scores."""
+        if stacked is None:
+            scores = mx.sigmoid(x @ self.weight.astype(mx.float32).T)
+            return scores + mx.sigmoid(x @ self.weight_1.astype(mx.float32).T)
+        if x.ndim >= 2 and x.shape[-2] <= DECODE_BLOCK_SIZE:
+            # Row-wise mat-vecs keep a verify block on the one-token path.
+            raw = (stacked @ x[..., None]).squeeze(-1)
+        else:
+            raw = x @ stacked.T
+        scores = mx.sigmoid(raw)
+        experts = self.weight.shape[0]
+        return scores[..., :experts] + scores[..., experts:]
+
+    def __call__(self, x, bias, stacked=None):
         x = x.astype(mx.float32)
-        scores = mx.sigmoid(x @ self.weight.astype(mx.float32).T)
-        scores += mx.sigmoid(x @ self.weight_1.astype(mx.float32).T)
+        if stacked is None and not self.training:
+            stacked = self.stacked()
+        scores = self._scores(x, stacked)
         ids = mx.argpartition(-(scores + bias), kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
@@ -149,6 +184,7 @@ class LatentMoE(nn.Module):
             config, config.n_shared_experts * config.moe_intermediate_size
         )
         self.sharding_group = None
+        self._compiled = None
         # A host may offer the routed outputs of a prefill chunk through its
         # own kernels: ``backend(switch_mlp, latent, ids)`` returns them, or
         # None to decline.
@@ -156,7 +192,21 @@ class LatentMoE(nn.Module):
 
     def __call__(self, x, router_bias=None):
         bias = self.e_score_correction_bias if router_bias is None else router_bias
-        ids, weights = self.gate(x, bias)
+        if (
+            not self.training
+            and self.sharding_group is None
+            and x.ndim == 3
+            and x.shape[1] <= DECODE_BLOCK_SIZE
+        ):
+            # Decode and verify blocks run as one compiled graph. The stacked
+            # router is prepared here because compiled code cannot evaluate.
+            if self._compiled is None:
+                self._compiled = mx.compile(self._forward, inputs=[self.state])
+            return self._compiled(x, bias, self.gate.stacked())
+        return self._forward(x, bias)
+
+    def _forward(self, x, bias, stacked=None):
+        ids, weights = self.gate(x, bias, stacked)
         latent = self.fc1_latent_proj(x)
         outputs = None
         if self.routed_backend is not None and self.sharding_group is None:
@@ -186,11 +236,28 @@ class HyperConnection(nn.Module):
         self.fn = mx.zeros((count, self.mult * config.hidden_size), dtype=mx.float32)
         self.base = mx.zeros((count,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
+        self._compiled = None
 
     def __call__(self, x):
+        if not self.training and x.ndim == 4 and x.shape[1] <= DECODE_BLOCK_SIZE:
+            # Decode and verify blocks run as one compiled graph, which fuses
+            # the short elementwise chains around the projection and kernel.
+            if self._compiled is None:
+                self._compiled = mx.compile(self._mix, inputs=[self.state])
+            return self._compiled(x)
+        return self._mix(x)
+
+    def _mix(self, x):
         flat = x.astype(mx.float32).flatten(-2)
+        fn = self.fn.astype(mx.float32)
+        if not self.training and x.shape[1] <= DECODE_BLOCK_SIZE:
+            # Row-wise mat-vecs: a short verify block then costs what the same
+            # tokens cost one at a time, instead of taking the GEMM path.
+            projected = (fn @ flat[..., None]).squeeze(-1)
+        else:
+            projected = flat @ fn.T
         # ERNIE places epsilon outside sqrt in the sublayer mHC mixers.
-        mixes = (flat @ self.fn.astype(mx.float32).T) / (
+        mixes = projected / (
             mx.sqrt(mx.mean(flat * flat, axis=-1, keepdims=True)) + self.norm_eps
         )
         use_kernel = (
@@ -219,14 +286,30 @@ class VirtualHeads(nn.Module):
         self.U = mx.zeros((heads, rank))
         self.V = mx.zeros((heads, rank))
         self.sharding_group = None
+        self._folded_source = None
+        self._folded = None
+
+    def _mix(self):
+        """``I + V U^T`` in fp32, folded once per weight load outside training."""
+        if self.training:
+            return (
+                mx.eye(self.U.shape[0])
+                + self.V.astype(mx.float32) @ self.U.astype(mx.float32).T
+            )
+        cached = self._folded_source
+        if cached is None or cached[0] is not self.U or cached[1] is not self.V:
+            self._folded = (
+                mx.eye(self.U.shape[0])
+                + self.V.astype(mx.float32) @ self.U.astype(mx.float32).T
+            )
+            mx.eval(self._folded)
+            self._folded_source = (self.U, self.V)
+        return self._folded
 
     def __call__(self, x):
         # x: B, L, heads, value_dim. Fold before applying to match the
-        # reference's rounding order; recompute to allow weight reloads.
-        mix = (
-            mx.eye(self.U.shape[0])
-            + self.V.astype(mx.float32) @ self.U.astype(mx.float32).T
-        )
+        # reference's rounding order.
+        mix = self._mix()
         heads = x.shape[-2]
         if self.sharding_group is not None:
             x = mx.distributed.all_gather(
@@ -643,7 +726,11 @@ class MLAAttention(nn.Module):
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(mask, pe_scores, -mx.inf)
-        if L == 1:
+        # Folding the per-head projections into the queries costs L rows; the
+        # other form projects the whole cached context on every call. Short
+        # decode and verify blocks fold, prefill chunks project.
+        folded = L == 1 or (not self.training and L <= DECODE_BLOCK_SIZE)
+        if folded:
             q_nope = self.embed_q(q_nope)
             k = v = kv
         else:
@@ -658,7 +745,7 @@ class MLAAttention(nn.Module):
             mask=pe_scores,
             sinks=self.attn_sink.astype(q_nope.dtype),
         )
-        if L == 1:
+        if folded:
             out = self.unembed_out(out)
         out = self.vha(out.transpose(0, 2, 1, 3)).flatten(-2)
         return _parallel_output(
@@ -708,6 +795,10 @@ class MLAAttention(nn.Module):
         return self.unembed_out(out.transpose(1, 0, 2)[None])
 
 
+# Decode and verify blocks expand through one compiled graph.
+_hc_expand_decode = mx.compile(hc_expand)
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -727,14 +818,16 @@ class DecoderLayer(nn.Module):
         self.ffn_hc = HyperConnection(config)
 
     def __call__(self, x, cache=None, router_bias=None):
+        short = not self.training and x.shape[1] <= DECODE_BLOCK_SIZE
+        expand = _hc_expand_decode if short else hc_expand
         h, post, comb = self.attn_hc(x)
         h = self.attn_norm(h)
         h = self.attn(h, cache)
-        x = hc_expand(h, x, post, comb)
+        x = expand(h, x, post, comb)
         h, post, comb = self.ffn_hc(x)
         h = self.ffn_norm(h)
         h = self.ffn(h) if router_bias is None else self.ffn(h, router_bias)
-        return hc_expand(h, x, post, comb)
+        return expand(h, x, post, comb)
 
 
 class ErnieModel(nn.Module):
@@ -778,6 +871,80 @@ class ErnieModel(nn.Module):
         return self.norm(self.hc_head(h))
 
 
+def _make_head_kernel():
+    """fp32 logits from a half-precision vocabulary weight.
+
+    One simdgroup per vocabulary row: each lane accumulates its share of the
+    row against up to eight hidden rows in fp32, so the weight is streamed
+    once however many rows are projected, at half the bytes of an fp32 copy.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint row  = threadgroup_position_in_grid.x;
+        uint lane = thread_position_in_threadgroup.x;
+        constexpr uint K4 = (uint)K / 4;
+        using T4 = vec<T, 4>;
+        const device T4* w4 = (const device T4*)weight + (size_t)row * K4;
+        float acc[R];
+        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+        for (uint i = lane; i < K4; i += 32) {
+            float4 wv = float4(w4[i]);
+            for (int r = 0; r < R; ++r) {
+                acc[r] += metal::dot(
+                    wv, *(const device float4*)(hidden + (uint)r * K + 4 * i));
+            }
+        }
+        for (int r = 0; r < R; ++r) {
+            float s = simd_sum(acc[r]);
+            if (lane == 0) logits[(size_t)r * V + row] = s;
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="ernie_vocab_head",
+        input_names=["hidden", "weight"],
+        output_names=["logits"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_head_kernel = _make_head_kernel()
+_HEAD_ROWS = 8
+
+
+def _half_precision_head(hidden, weight):
+    rows = hidden.reshape(-1, hidden.shape[-1])
+    count, width = rows.shape
+    vocab = weight.shape[0]
+    parts = []
+    for start in range(0, count, _HEAD_ROWS):
+        chunk = rows[start : start + _HEAD_ROWS]
+        kept = chunk.shape[0]
+        if kept == 1:
+            # One row runs about three times slower than two on an M5 Ultra
+            # (4.9 ms against 1.8 ms), for this kernel and for MLX's own
+            # matmul alike, so a lone row is projected twice.
+            chunk = mx.concatenate([chunk, chunk], axis=0)
+        logits = _head_kernel(
+            inputs=[chunk, weight],
+            template=[
+                ("T", weight.dtype),
+                ("K", width),
+                ("V", vocab),
+                ("R", chunk.shape[0]),
+            ],
+            grid=(vocab * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(chunk.shape[0], vocab)],
+            output_dtypes=[mx.float32],
+        )[0]
+        parts.append(logits[:kept])
+    logits = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+    return logits.reshape(*hidden.shape[:-1], vocab)
+
+
 class MultiMax(nn.Module):
     def __init__(self):
         super().__init__()
@@ -805,9 +972,6 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.multimax = MultiMax()
         self.sharding_group = None
-        # FP32 copy of a half-precision vocabulary weight, see project_head.
-        self._head_source = None
-        self._head_fp32 = None
 
     def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
         if kwargs.pop("speculative_verify", False):
@@ -845,22 +1009,23 @@ class LanguageModel(nn.Module):
     def project_head(self, hidden):
         """Vocabulary logits in fp32, before MultiMax.
 
-        The released weight is half precision and the projection is fp32, so a
+        The released weight is half precision and the projection is fp32. A
         plain matmul promotes all vocab_size x hidden_size values on every
-        call: about 3 GB of temporaries per decode step on ERNIE 5.5 Flash.
-        Cast the weight once instead. The product is unchanged.
+        call; the kernel reads the weight in place and accumulates in fp32.
         """
         hidden = hidden.astype(mx.float32)
         head = self.lm_head
         weight = head.get("weight") if type(head) is nn.Linear else None
-        if weight is None or weight.dtype not in (mx.bfloat16, mx.float16):
+        if (
+            self.training
+            or _head_kernel is None
+            or weight is None
+            or weight.dtype not in (mx.bfloat16, mx.float16)
+            or weight.shape[1] % 4
+            or mx.default_device() != mx.gpu
+        ):
             return head(hidden)
-        if self._head_source is not weight:
-            # Follows a weight reload: the copy belongs to this exact array.
-            self._head_fp32 = weight.astype(mx.float32)
-            mx.eval(self._head_fp32)
-            self._head_source = weight
-        return hidden @ self._head_fp32.T
+        return _half_precision_head(hidden, weight)
 
     def _project_logits(self, hidden):
         return self.multimax(self.project_head(hidden))

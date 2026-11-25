@@ -236,27 +236,34 @@ def test_drafter_rejects_a_mismatched_target():
         raise AssertionError("expected an incompatible target to be rejected")
 
 
-def test_project_head_casts_a_half_precision_weight_once():
+@pytest.mark.parametrize("rows", [1, 2, 3, 8, 11])
+def test_project_head_reads_a_half_precision_weight_in_place(rows):
     _, model = _target()
     lm = model.language_model
     weight = lm.lm_head.weight.astype(mx.bfloat16)
     lm.lm_head.weight = weight
-    hidden = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    hidden = mx.random.normal((1, rows, 64)).astype(mx.bfloat16)
 
-    # The same product as promoting the weight on every call.
+    # The product of the fp32 hidden states with the weight's exact values.
     expected = hidden.astype(mx.float32) @ weight.astype(mx.float32).T
-    assert mx.array_equal(lm.project_head(hidden), expected)
-    assert lm._head_fp32.dtype == mx.float32
-    copy = lm._head_fp32
-    lm.project_head(hidden)
-    assert lm._head_fp32 is copy
-    # The copy is not a parameter, so it is neither saved nor counted.
-    assert not any("_head_fp32" in name for name, _ in tree_flatten(model.parameters()))
+    logits = lm.project_head(hidden)
+    assert logits.dtype == mx.float32
+    assert logits.shape == (1, rows, 128)
+    assert mx.allclose(logits, expected, atol=1e-5, rtol=1e-5)
+    assert mx.allclose(
+        lm._project_logits(hidden), lm.multimax(expected), atol=1e-5, rtol=1e-5
+    )
 
-    # A reloaded weight gets a fresh copy.
+
+def test_project_head_follows_a_reloaded_weight():
+    _, model = _target()
+    lm = model.language_model
+    weight = lm.lm_head.weight.astype(mx.bfloat16)
+    hidden = mx.random.normal((2, 1, 64)).astype(mx.bfloat16)
+    lm.lm_head.weight = weight
+    first = lm.project_head(hidden)
     lm.lm_head.weight = (weight.astype(mx.float32) * 2).astype(mx.bfloat16)
-    assert mx.array_equal(lm.project_head(hidden), 2 * expected)
-    assert mx.array_equal(lm._project_logits(hidden), lm.multimax(2 * expected))
+    assert mx.allclose(lm.project_head(hidden), 2 * first, atol=1e-5, rtol=1e-5)
 
 
 def test_project_head_leaves_a_float32_weight_alone():
@@ -264,7 +271,64 @@ def test_project_head_leaves_a_float32_weight_alone():
     lm = model.language_model
     hidden = mx.random.normal((1, 2, 64))
     assert mx.array_equal(lm.project_head(hidden), lm.lm_head(hidden))
-    assert lm._head_fp32 is None
+
+
+def _stream(rows, seed=3):
+    mx.random.seed(seed)
+    return mx.random.normal((1, rows, 4, 64))
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_compiled_short_block_paths_match_the_plain_ops(rows):
+    """Decode-sized calls take compiled paths; they must not change the numbers."""
+    _, model = _target()
+    layer = model.language_model.model.layers[0]
+    x = _stream(rows)
+
+    mixed = layer.attn_hc(x)
+    plain = layer.attn_hc._mix(x)
+    for got, want in zip(mixed, plain):
+        assert mx.allclose(got, want, atol=1e-6, rtol=1e-6)
+
+    h = x[:, :, 0]
+    # Layer 0 is the dense one; layer 1 routes experts.
+    ffn = model.language_model.model.layers[1].ffn
+    assert mx.allclose(
+        ffn(h), ffn._forward(h, ffn.e_score_correction_bias), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_router_scores_match_the_two_product_form():
+    _, model = _target()
+    gate = model.language_model.model.layers[1].ffn.gate
+    x = mx.random.normal((1, 3, 64))
+    stacked = gate._scores(x, gate.stacked())
+    separate = gate._scores(x, None)
+    assert mx.allclose(stacked, separate, atol=1e-6, rtol=1e-6)
+    # A long chunk takes the GEMM form of the same product.
+    wide = mx.random.normal((1, 40, 64))
+    assert mx.allclose(
+        gate._scores(wide, gate.stacked()), gate._scores(wide, None), atol=1e-6
+    )
+    # The stacked copy follows a weight reload.
+    gate.weight = gate.weight * 2
+    assert mx.allclose(
+        gate._scores(x, gate.stacked()), gate._scores(x, None), atol=1e-6
+    )
+
+
+def test_virtual_heads_fold_follows_a_weight_reload():
+    _, model = _target()
+    vha = model.language_model.model.layers[0].attn.vha
+    x = mx.random.normal((1, 2, 4, 16))
+
+    def reference():
+        mix = mx.eye(vha.U.shape[0]) + vha.V @ vha.U.T
+        return mix @ x
+
+    assert mx.allclose(vha(x), reference(), atol=1e-6)
+    vha.U = vha.U * 3
+    assert mx.allclose(vha(x), reference(), atol=1e-6)
 
 
 def test_depth_policy_follows_acceptance():

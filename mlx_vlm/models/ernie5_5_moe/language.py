@@ -136,12 +136,20 @@ class LatentMoE(nn.Module):
             config, config.n_shared_experts * config.moe_intermediate_size
         )
         self.sharding_group = None
+        # A host may offer the routed outputs of a prefill chunk through its
+        # own kernels: ``backend(switch_mlp, latent, ids)`` returns them, or
+        # None to decline.
+        self.routed_backend = None
 
     def __call__(self, x, router_bias=None):
         bias = self.e_score_correction_bias if router_bias is None else router_bias
         ids, weights = self.gate(x, bias)
         latent = self.fc1_latent_proj(x)
-        outputs = self.switch_mlp(latent, ids)
+        outputs = None
+        if self.routed_backend is not None and self.sharding_group is None:
+            outputs = self.routed_backend(self.switch_mlp, latent, ids)
+        if outputs is None:
+            outputs = self.switch_mlp(latent, ids)
         if self.sharding_group is not None:
             # Reconstruct each expert before weighting and the latent RMSNorm.
             outputs = mx.distributed.all_sum(outputs, group=self.sharding_group)

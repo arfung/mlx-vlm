@@ -15,7 +15,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.models.ernie5_5_moe import language
-from mlx_vlm.models.ernie5_5_moe.language import HCAAttention, MLAAttention
+from mlx_vlm.models.ernie5_5_moe.language import HCAAttention, Indexer, MLAAttention
 
 WINDOW = 4
 TOPK = 4
@@ -92,6 +92,7 @@ def _paths():
         MLAAttention.gathered_min_keys,
         MLAAttention.gathered_min_keys_short,
         MLAAttention.gathered_rows,
+        Indexer.score_elements,
         language._index_kernel,
     )
     MLAAttention.gathered_min_keys = 0
@@ -103,6 +104,7 @@ def _paths():
         MLAAttention.gathered_min_keys,
         MLAAttention.gathered_min_keys_short,
         MLAAttention.gathered_rows,
+        Indexer.score_elements,
         language._index_kernel,
     ) = saved
 
@@ -316,6 +318,26 @@ def test_gathered_selection_names_the_keys_of_the_dense_mask(model, first, rows)
         # No key twice, or it would be counted twice in the softmax.
         assert len(chosen) == len(set(chosen))
         assert sorted(chosen) == [k for k, seen in enumerate(dense[row]) if seen]
+
+
+@pytest.mark.parametrize("first,rows", [(0, 64), (30, 34), (41, 23)])
+def test_gathered_selection_is_the_same_ranked_in_row_blocks(model, first, rows):
+    indexer, x, qr, mask, cache = _indexer_inputs(model, first, rows)
+    _, (ids, usable) = indexer(x, qr, mask, copy.deepcopy(cache), gather=True)
+    # A budget this small ranks the chunk a decode block of rows at a time.
+    Indexer.score_elements = 1
+    _, (block_ids, block_usable) = indexer(
+        x, qr, mask, copy.deepcopy(cache), gather=True
+    )
+    assert block_ids.shape == ids.shape
+
+    def chosen(ids, usable):
+        return [
+            sorted(key for key, keep in zip(keys, kept) if keep)
+            for keys, kept in zip(ids.tolist(), usable.tolist())
+        ]
+
+    assert chosen(block_ids, block_usable) == chosen(ids, usable)
 
 
 def test_index_kernel_matches_the_plain_head_sum(model):

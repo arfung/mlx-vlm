@@ -626,6 +626,10 @@ class Indexer(nn.Module):
     # passes over heads x keys values, which for a decode step at 30K tokens
     # of context costs more than the rest of the layer.
     kernel_scores = True
+    # Per-head scores (rows x heads x keys) one ranking pass may hold. A chunk
+    # that needs more is ranked a block of rows at a time, each block finished
+    # before the next, so the working memory stops growing with the context.
+    score_elements = 1 << 31
 
     def __init__(self, config):
         super().__init__()
@@ -678,6 +682,25 @@ class Indexer(nn.Module):
             )
         return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
 
+    def _ranked(self, q, k, weights, mask, start, rows, L, S):
+        """Ranked key ids for ``rows`` queries from ``start``, and which are real.
+
+        Returns ``(ids, ranked)``, both (rows, topk). Only keys older than a
+        query's recent window are ranked; the causal diagonal of query ``j``
+        is physical column ``S - L + j``.
+        """
+        queries = mx.arange(S - L + start, S - L + start + rows)
+        valid = mx.arange(S)[None, :] - queries[:, None] <= -self.window
+        if mask is not None:
+            valid = valid & mask[..., start : start + rows, :]
+        scores = self._scores(
+            q[:, :, start : start + rows], k, weights[:, start : start + rows]
+        )
+        scores = mx.where(valid, scores, -mx.inf)
+        ids = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
+        ranked = mx.take_along_axis(scores, ids, axis=-1) > -mx.inf
+        return ids[0, 0], ranked[0, 0]
+
     def __call__(self, x, qr, mask, cache=None, gather=False):
         """Pick the keys each query attends to.
 
@@ -702,21 +725,25 @@ class Indexer(nn.Module):
         S = k.shape[2]
         if S <= self.topk + self.window:
             return mask, None
-        # Physical cache columns include batch left padding; the causal diagonal
-        # is still S-L+j. Always include the recent window, rank only older keys.
-        delta = mx.arange(S)[None, :] - mx.arange(S - L, S)[:, None]
-        older = delta <= -self.window
-        valid = older if mask is None else older & mask
         weights = (
             self.weights_proj(x).astype(mx.float32) * (self.heads * self.dim) ** -0.5
         )
-        scores = mx.where(valid, self._scores(q, k, weights), -mx.inf)
-        ids = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
         if gather:
+            block = max(DECODE_BLOCK_SIZE, self.score_elements // (self.heads * S))
+            if block >= L:
+                ids, ranked = self._ranked(q, k, weights, mask, 0, L, L, S)
+            else:
+                parts = []
+                for start in range(0, L, block):
+                    rows = min(block, L - start)
+                    part = self._ranked(q, k, weights, mask, start, rows, L, S)
+                    mx.eval(part)
+                    parts.append(part)
+                ids = mx.concatenate([part[0] for part in parts], axis=0)
+                ranked = mx.concatenate([part[1] for part in parts], axis=0)
             # A query early in the context has fewer than topk older keys; the
             # rest of its ranked slots hold keys it must not see, and its
             # window may start before the first key.
-            ranked = mx.take_along_axis(scores, ids, axis=-1) > -mx.inf
             recent = (
                 mx.arange(S - L, S)[:, None] - mx.arange(self.window - 1, -1, -1)[None]
             )
@@ -724,12 +751,19 @@ class Indexer(nn.Module):
             recent = mx.maximum(recent, 0)
             if mask is not None:
                 inside = inside & mx.take_along_axis(
-                    mx.broadcast_to(mask, scores.shape)[0, 0], recent, axis=-1
+                    mx.broadcast_to(mask, (B, 1, L, S))[0, 0], recent, axis=-1
                 )
             return None, (
-                mx.concatenate((ids[0, 0], recent), axis=-1),
-                mx.concatenate((ranked[0, 0], inside), axis=-1),
+                mx.concatenate((ids, recent), axis=-1),
+                mx.concatenate((ranked, inside), axis=-1),
             )
+        # Physical cache columns include batch left padding; the causal diagonal
+        # is still S-L+j. Always include the recent window, rank only older keys.
+        delta = mx.arange(S)[None, :] - mx.arange(S - L, S)[:, None]
+        older = delta <= -self.window
+        valid = older if mask is None else older & mask
+        scores = mx.where(valid, self._scores(q, k, weights), -mx.inf)
+        ids = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
         recent = (delta <= 0) & (delta > -self.window)
         sparse = mx.put_along_axis(
             mx.zeros(scores.shape, dtype=mx.bool_), ids, mx.array(True), axis=-1

@@ -1,5 +1,6 @@
 """ERNIE 5.5 Flash DSpark: target captures, checkpoint mapping and round loop."""
 
+import copy
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -447,3 +448,100 @@ def test_round_loop_asks_the_drafter_for_its_block_size():
     # Without the hook the stock behaviour is unchanged.
     stock = SimpleNamespace(prefer_requested_block_size=True)
     assert _dflash_next_block_size(stock, 8, 100) == 8
+
+
+def _prefilled(model, length, seed):
+    mx.random.seed(seed)
+    cache = model.make_cache()
+    model.language_model(mx.random.randint(1, 128, (1, length)), cache=cache)
+    mx.eval([entry.state for entry in cache])
+    return cache
+
+
+def _cache_arrays(cache):
+    return [
+        value
+        for entry in cache
+        for _, value in tree_flatten(entry.state)
+        if value is not None
+    ]
+
+
+@pytest.mark.parametrize(
+    "contexts,blocks",
+    [((37, 11), (3, 5)), ((5, 60, 130), (2, 4, 2)), ((9, 9, 9, 9), (2, 2, 2, 2))],
+)
+def test_verify_rows_match_each_request_verified_alone(contexts, blocks):
+    # Blocks of two or more rows: the requests' rows share every token-wise
+    # launch and each request attends over its own cache.
+    _, model = _target()
+    lm = model.language_model
+    layers = [0, len(lm.layers) - 1]
+    caches = [_prefilled(model, n, seed) for seed, n in enumerate(contexts)]
+    mx.random.seed(99)
+    inputs = [mx.random.randint(1, 128, (1, rows)) for rows in blocks]
+    alone = []
+    for cache, block in zip(caches, inputs):
+        own = copy.deepcopy(cache)
+        out = lm(block, cache=own, capture_layer_ids=layers, speculative_verify=True)
+        alone.append((out, own))
+    together = lm.speculative_verify_rows(inputs, caches, capture_layer_ids=layers)
+    for index, ((logits, captured, transaction), (out, own)) in enumerate(
+        zip(together, alone)
+    ):
+        assert mx.array_equal(logits, out.logits)
+        assert all(mx.array_equal(a, b) for a, b in zip(captured, out.hidden_states))
+        # Each request keeps a different part of its block.
+        keep = 1 + index % blocks[index]
+        transaction.commit([keep])
+        out.gdn_states.commit([keep])
+        ours, theirs = _cache_arrays(caches[index]), _cache_arrays(own)
+        assert [a.shape for a in ours] == [b.shape for b in theirs]
+        assert all(mx.array_equal(a, b) for a, b in zip(ours, theirs))
+
+
+def test_verify_rows_leave_the_caches_alone_when_they_fail():
+    _, model = _target()
+    lm = model.language_model
+    caches = [_prefilled(model, 20, 0), _prefilled(model, 30, 1)]
+    before = [[mx.array(a) for a in _cache_arrays(cache)] for cache in caches]
+    too_many = [mx.zeros((1, 5), dtype=mx.int32), mx.zeros((1, 5), dtype=mx.int32)]
+    with pytest.raises(ValueError):
+        lm.speculative_verify_rows(too_many, caches)
+    # A transaction that is opened and abandoned restores its cache.
+    blocks = [mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 4), dtype=mx.int32)]
+    for _, _, transaction in lm.speculative_verify_rows(blocks, caches):
+        transaction.abort()
+    for cache, held in zip(caches, before):
+        now = _cache_arrays(cache)
+        assert [a.shape for a in now] == [b.shape for b in held]
+        assert all(mx.array_equal(a, b) for a, b in zip(now, held))
+
+
+def test_request_state_keeps_two_requests_apart():
+    config, model = _target()
+    draft = _drafter(config, 8)
+    draft.reset(model)
+    draft.begin_request([1, 2, 3, 4, 5, 6, 7])
+    first = draft.request_state()
+    draft.reset(model)
+    draft.begin_request(None)
+    draft.accept_lens.append(2)
+    draft.draft_lens.append(3)
+    second = draft.request_state()
+    draft.use_request(first, depth_floor=0.5)
+    assert draft.accept_lens == [] and draft._copy.tokens == [1, 2, 3, 4, 5, 6, 7]
+    assert draft.depth_floor == 0.5
+    draft.observe(8)
+    draft.use_request(second)
+    assert draft.accept_lens == [2] and draft._copy is None
+    assert draft.depth_floor is None
+    assert first["_copy"].tokens[-1] == 8
+
+
+def test_depth_floor_makes_a_proposal_earn_more():
+    policy = DepthPolicy(7)
+    policy.reach = [1.0, 0.8, 0.5, 0.33, 0.25, 0.1, 0.05, 0.02]
+    assert policy.proposals() == 4
+    assert policy.proposals(floor=0.3) == 3
+    assert policy.proposals(floor=0.6) == 1

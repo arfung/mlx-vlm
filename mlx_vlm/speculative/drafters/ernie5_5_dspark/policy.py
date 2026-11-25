@@ -49,11 +49,18 @@ class DepthPolicy:
         # Index i holds depth i; index 0 is the anchor, always reached.
         self.reach = [1.0] + prior[: self.max_proposals]
 
-    def proposals(self, limit: Optional[int] = None) -> int:
+    def proposals(
+        self, limit: Optional[int] = None, floor: Optional[float] = None
+    ) -> int:
+        """Proposals to draft. ``floor`` raises the reach a depth needs: when
+        several requests share the verify forward its fixed cost is already
+        spread, so an extra row has to earn more."""
         limit = self.max_proposals if limit is None else min(limit, self.max_proposals)
         count = 1
         for depth in range(2, limit + 1):
             needed = self.shallow_threshold if depth <= self.shallow else self.threshold
+            if floor is not None:
+                needed = max(needed, floor)
             if self.reach[depth] < needed:
                 break
             count = depth

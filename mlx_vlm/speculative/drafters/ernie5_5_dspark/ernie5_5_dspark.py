@@ -133,6 +133,22 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
     adaptive_depth = True
     # Draft from an earlier occurrence when the reply repeats the request.
     copy_drafts = True
+    # Reach probability below which a proposal is not drafted, on top of the
+    # policy's own thresholds. A loop that verifies several requests in one
+    # forward sets it for the round.
+    depth_floor = None
+    # What belongs to one request. ``request_state`` and ``use_request`` move
+    # it out and in, so one drafter can serve several requests in turn.
+    _REQUEST_FIELDS = (
+        "accept_lens",
+        "draft_lens",
+        "_policy",
+        "_policy_rounds",
+        "_copy",
+        "_copy_draft",
+        "copy_rounds",
+        "copy_accepted",
+    )
 
     def __init__(self, config):
         super().__init__(config)
@@ -158,6 +174,16 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         """Record a committed token (the first one and every emitted one)."""
         if self._copy is not None:
             self._copy.append(int(token))
+
+    def request_state(self):
+        """The current request's state, to hand back to ``use_request``."""
+        return {name: getattr(self, name) for name in self._REQUEST_FIELDS}
+
+    def use_request(self, state, depth_floor=None):
+        """Continue the request that ``state`` was taken from."""
+        for name, value in state.items():
+            setattr(self, name, value)
+        self.depth_floor = depth_floor
 
     def reset(self, target_model):
         cache = super().reset(target_model)
@@ -192,7 +218,19 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
                 return len(candidate) + 1
         if not self.adaptive_depth:
             return block_total
-        return policy.proposals(limit) + 1
+        return policy.proposals(limit, self.depth_floor) + 1
+
+    def reach(self, proposals: int) -> float:
+        """Estimated chance that the current request's round accepts its
+        first ``proposals`` drafts; a caller sharing out verify rows between
+        requests gives the next row to the one most likely to use it."""
+        if self._copy_draft is not None and len(self._copy_draft) >= proposals:
+            # A run the head agreed to copy is accepted nearly whole.
+            return 0.9
+        policy = self._policy
+        if policy is None or proposals >= len(policy.reach):
+            return 0.0
+        return float(policy.reach[max(0, int(proposals))])
 
     def validate_target_compatibility(self, target_model):
         target = getattr(target_model, "language_model", target_model)

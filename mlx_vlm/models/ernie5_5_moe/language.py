@@ -31,6 +31,7 @@ from ..deepseek_v4.hyper_connection import (
     _hc_sinkhorn_collapse_kernel,
     hc_expand,
 )
+from ..linear import DECODE_BLOCK_SIZE
 from ..deepseek_v4.language import (
     CompressedAttention,
     Compressor,
@@ -224,6 +225,44 @@ class VirtualHeads(nn.Module):
         return mix.astype(x.dtype) @ x
 
 
+def _attention_weights(scores, mask, sinks):
+    """Softmax over the visible keys and a per-head sink.
+
+    The sink is one more logit per head that takes its share of the softmax
+    and contributes no value. ``mask`` is boolean; ``sinks`` must broadcast
+    against the scores once it is given a trailing axis.
+    """
+    scores = mx.where(mask, scores, -mx.inf)
+    sink = mx.broadcast_to(
+        sinks.astype(scores.dtype)[..., None], (*scores.shape[:-1], 1)
+    )
+    weights = mx.softmax(mx.concatenate((scores, sink), axis=-1), axis=-1, precise=True)
+    return weights[..., :-1]
+
+
+def _window_bands(kv, earlier, window, blocks):
+    """Regroup local keys so each block of ``window`` queries gets its own keys.
+
+    ``kv`` is (B, 1, earlier + L, D): the ``earlier`` keys kept from before the
+    chunk, then the chunk's own. Query ``p`` of block ``i`` sees the ``window``
+    keys ending at itself, which all lie in the block before it or in its own,
+    so block ``i`` reads keys ``(i - 1) * window`` to ``(i + 1) * window`` and
+    the mask is the same band for every block. Returns the keys as
+    (B, blocks, 2 * window, D) and the mask as (blocks, window, 2 * window).
+    """
+    B, _, length, dim = kv.shape
+    front = window - earlier
+    tail = (blocks + 1) * window - front - length
+    kv = mx.pad(kv[:, 0], ((0, 0), (front, tail), (0, 0)))
+    kv = kv.reshape(B, blocks + 1, window, dim)
+    keys = mx.concatenate((kv[:, :-1], kv[:, 1:]), axis=2)
+    own = mx.arange(window)[None] <= mx.arange(window)[:, None]
+    band = mx.concatenate((~own, own), axis=1)
+    # Only the first block reaches back before the earliest key held.
+    held = (mx.arange(blocks)[:, None] > 0) | (mx.arange(2 * window)[None] >= front)
+    return keys, band[None] & held[:, None]
+
+
 class HCACompressor(Compressor):
     def __call__(self, x, pool_cache, offset):
         B, _, _ = x.shape
@@ -250,6 +289,9 @@ class HCACompressor(Compressor):
 
 
 class HCAAttention(CompressedAttention):
+    # Attend long single-row chunks in window-sized bands.
+    banded_window = True
+
     def __init__(self, config, layer_idx):
         super().__init__(config, layer_idx)
         self.compressor = HCACompressor(config, self.compress_ratio, self.head_dim)
@@ -274,8 +316,8 @@ class HCAAttention(CompressedAttention):
         kv = self.rope(self.kv_norm(self.wkv(x))[:, None], offset)
         if local is not None:
             kv, _ = local.update_and_fetch(kv, mx.zeros((B, 1, L, 0), dtype=x.dtype))
-        mask = _align_local_mask(mask, kv.shape[2])
         pooled = self.compressor(x, pool, offset)
+        pool_mask = None
         if pooled.shape[1]:
             if pool is not None:
                 pool_mask = pool.make_mask(L, offset)
@@ -283,6 +325,11 @@ class HCAAttention(CompressedAttention):
                 pool_mask = mx.arange(pooled.shape[1])[None] < (
                     mx.arange(1, L + 1)[:, None] // self.compress_ratio
                 )
+        if self._banded(L, kv.shape[2] - L, local, mask, pooled, pool_mask):
+            out = self._banded_attention(q, kv, pooled, pool_mask)
+            return self._output(out, qr, offset)
+        mask = _align_local_mask(mask, kv.shape[2])
+        if pooled.shape[1]:
             if mask is None and pool_mask is not None:
                 mask = mx.ones((B, 1, L, kv.shape[2]), dtype=mx.bool_)
             kv = mx.concatenate((kv, pooled[:, None]), axis=2)
@@ -296,12 +343,105 @@ class HCAAttention(CompressedAttention):
             mask=mask,
             sinks=self.attn_sink.astype(q.dtype),
         )
+        return self._output(out, qr, offset)
+
+    def _output(self, out, qr, offset):
+        B, _, L, _ = out.shape
         out = self.rope(out, offset, inverse=True).transpose(0, 2, 1, 3)
         out = self.vha(out).reshape(B, L, self.o_groups, -1).transpose(0, 2, 1, 3)
         out = self.wo_a(out).transpose(0, 2, 1, 3).flatten(-2)
         return _parallel_output(
             self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
         )
+
+    def _banded(self, L, earlier, local, mask, pooled, pool_mask):
+        """Whether this call can attend block by block instead of densely.
+
+        The dense path scores every query of a chunk against every key of the
+        chunk and masks all but ``sliding_window`` of them. That is the right
+        shape for a decode step and for batched caches, whose masks carry
+        padding; a long chunk behind a plain windowed mask attends in bands.
+        The checks are on what the caches returned, not on their classes, so a
+        cache rebuilt by a server from its own store qualifies too.
+        """
+        window = self.config.sliding_window
+        if not self.banded_window or self.training or L < 4 * window:
+            return False
+        if local is not None and (
+            getattr(local, "keep", 0) != 0 or getattr(local, "max_size", None) != window
+        ):
+            return False
+        # The plain mask is (L, earlier + L) with at most window - 1 keys kept
+        # from before the chunk; anything else carries per-row padding.
+        if not isinstance(mask, mx.array) or mask.shape != (L, earlier + L):
+            return False
+        if not 0 <= earlier < window:
+            return False
+        count = pooled.shape[1]
+        return pool_mask is None or pool_mask.shape == (L, count)
+
+    def _banded_attention(self, q, kv, pooled, pool_mask):
+        B, H, L, D = q.shape
+        window = self.config.sliding_window
+        blocks = -(-L // window)
+        padded = blocks * window
+        keys, mask = _window_bands(kv, kv.shape[2] - L, window, blocks)
+        count = pooled.shape[1]
+        if count:
+            if pool_mask is None:
+                pool_mask = mx.ones((L, count), dtype=mx.bool_)
+            pool_mask = mx.pad(pool_mask, ((0, padded - L), (0, 0)))
+            mask = mx.concatenate(
+                (mask, pool_mask.reshape(blocks, window, count)), axis=-1
+            )
+            keys = mx.concatenate(
+                (keys, mx.broadcast_to(pooled[:, None], (B, blocks, count, D))),
+                axis=2,
+            )
+        q = mx.pad(q, ((0, 0), (0, 0), (0, padded - L), (0, 0)))
+        keys = keys[:, None]
+        q = q.reshape(B, H, blocks, window, D)
+        scores = (q * self.scale) @ keys.swapaxes(-1, -2)
+        weights = _attention_weights(scores, mask, self.attn_sink[:, None, None])
+        out = weights.astype(keys.dtype) @ keys
+        return out.reshape(B, H, padded, D)[:, :, :L]
+
+
+def _make_index_kernel():
+    """Weighted head sum of the indexer's scores, in one pass.
+
+    ``scores`` holds every head's query-key product as (rows, heads, keys) in
+    the model's precision. The plain form widens all of it to fp32, weights it
+    and sums over heads, three passes over a tensor of 2 GB per 8K keys for a
+    2048-row chunk; here each output reads its 64 values once.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        ulong row = thread_position_in_grid.y;
+        ulong key = thread_position_in_grid.x;
+        ulong H = scores_shape[1];
+        ulong S = scores_shape[2];
+        const device float* w = weights + row * H;
+        float acc = 0.0f;
+        for (ulong h = 0; h < H; ++h) {
+            acc += w[h] * metal::max((float)scores[(row * H + h) * S + key], 0.0f);
+        }
+        out[row * S + key] = acc;
+    """
+    return mx.fast.metal_kernel(
+        name="ernie_index_scores",
+        input_names=["scores", "weights"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_index_kernel = _make_index_kernel()
+# Rows scored per kernel launch; bounds the per-head score tensor.
+_INDEX_ROWS = 512
 
 
 class Indexer(nn.Module):
@@ -323,7 +463,49 @@ class Indexer(nn.Module):
             base=config.rope_theta,
         )
 
-    def __call__(self, x, qr, mask, cache=None):
+    def _scores(self, q, k, weights):
+        """Each query's score for every key: (B, 1, L, S) in fp32.
+
+        ``q`` is (B, heads, L, dim), ``k`` (B, 1, S, dim) and ``weights``
+        (B, L, heads) in fp32.
+        """
+        B, _, L, _ = q.shape
+        S = k.shape[2]
+        if _index_kernel is None or self.training or L <= DECODE_BLOCK_SIZE:
+            scores = mx.maximum(q @ k.swapaxes(-1, -2), 0).astype(mx.float32)
+            return (scores * weights.transpose(0, 2, 1)[..., None]).sum(
+                axis=1, keepdims=True
+            )
+        q = q.transpose(0, 2, 1, 3)
+        keys = k.swapaxes(-1, -2)
+        parts = []
+        for start in range(0, L, _INDEX_ROWS):
+            rows = min(_INDEX_ROWS, L - start)
+            scores = q[:, start : start + rows] @ keys
+            parts.append(
+                _index_kernel(
+                    inputs=[
+                        scores.reshape(B * rows, self.heads, S),
+                        weights[:, start : start + rows].reshape(-1, self.heads),
+                    ],
+                    grid=(S, B * rows, 1),
+                    threadgroup=(32, 1, 1),
+                    output_shapes=[(B * rows, S)],
+                    output_dtypes=[mx.float32],
+                )[0].reshape(B, 1, rows, S)
+            )
+        return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=2)
+
+    def __call__(self, x, qr, mask, cache=None, gather=False):
+        """Pick the keys each query attends to.
+
+        Returns ``(mask, indices)``. Without ``gather`` the mask is the dense
+        (B, 1, L, S) selection and ``indices`` names the selected keys only for
+        a single query. With ``gather`` (single-row chunks) there is no dense
+        mask: ``indices`` is ``(ids, usable)``, both (L, topk + window), every
+        query's ranked keys followed by its recent window, and which of them
+        it may actually attend to.
+        """
         B, L, _ = x.shape
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
@@ -340,18 +522,32 @@ class Indexer(nn.Module):
         # Physical cache columns include batch left padding; the causal diagonal
         # is still S-L+j. Always include the recent window, rank only older keys.
         delta = mx.arange(S)[None, :] - mx.arange(S - L, S)[:, None]
-        recent = (delta <= 0) & (delta > -self.window)
         older = delta <= -self.window
         valid = older if mask is None else older & mask
-        scores = mx.maximum(q @ k.swapaxes(-1, -2), 0).astype(mx.float32)
         weights = (
             self.weights_proj(x).astype(mx.float32) * (self.heads * self.dim) ** -0.5
         )
-        scores = (scores * weights.transpose(0, 2, 1)[..., None]).sum(
-            axis=1, keepdims=True
-        )
-        scores = mx.where(valid, scores, -mx.inf)
+        scores = mx.where(valid, self._scores(q, k, weights), -mx.inf)
         ids = mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
+        if gather:
+            # A query early in the context has fewer than topk older keys; the
+            # rest of its ranked slots hold keys it must not see, and its
+            # window may start before the first key.
+            ranked = mx.take_along_axis(scores, ids, axis=-1) > -mx.inf
+            recent = (
+                mx.arange(S - L, S)[:, None] - mx.arange(self.window - 1, -1, -1)[None]
+            )
+            inside = recent >= 0
+            recent = mx.maximum(recent, 0)
+            if mask is not None:
+                inside = inside & mx.take_along_axis(
+                    mx.broadcast_to(mask, scores.shape)[0, 0], recent, axis=-1
+                )
+            return None, (
+                mx.concatenate((ids[0, 0], recent), axis=-1),
+                mx.concatenate((ranked[0, 0], inside), axis=-1),
+            )
+        recent = (delta <= 0) & (delta > -self.window)
         sparse = mx.put_along_axis(
             mx.zeros(scores.shape, dtype=mx.bool_), ids, mx.array(True), axis=-1
         )
@@ -366,6 +562,12 @@ class Indexer(nn.Module):
 
 
 class MLAAttention(nn.Module):
+    # Attend long single-row chunks over each query's selected keys only.
+    gathered_keys = True
+    # Context length from which gathering beats the dense product.
+    gathered_min_keys = 6144
+    gathered_rows = 512
+
     def __init__(self, config):
         super().__init__()
         self.heads = config.hybrid_mla_num_attention_heads
@@ -411,7 +613,16 @@ class MLAAttention(nn.Module):
         k_pe = self.rope(k_pe[:, None], offset)
         if latent_cache is not None:
             kv, k_pe = latent_cache.update_and_fetch(kv, k_pe)
-        mask, indices = self.indexer(x, qr, mask, index_cache)
+        gathered = self._gathered(B, L, kv.shape[2], latent_cache)
+        mask, indices = self.indexer(x, qr, mask, index_cache, gather=gathered)
+        if gathered:
+            out = self._gathered_attention(q_nope, q_pe, kv, k_pe, *indices)
+            out = self.vha(out.transpose(0, 2, 1, 3)).flatten(-2)
+            return _parallel_output(
+                self.wo_b,
+                out * mx.sigmoid(self.o_gate(qr)),
+                self.vha.sharding_group,
+            )
         if indices is not None:
             take = indices[:, :, 0, :, None]
             kv = mx.take_along_axis(kv, take, axis=2)
@@ -441,6 +652,48 @@ class MLAAttention(nn.Module):
         return _parallel_output(
             self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
         )
+
+    def _gathered(self, B, L, S, latent_cache):
+        """Whether this call attends over gathered keys instead of all of them.
+
+        Each query keeps ``index_topk`` ranked keys and its recent window, yet
+        the dense path scores it against the whole context and projects that
+        context per head on every call, so a chunk costs more the longer the
+        prompt already is. Gathering every query's own keys costs the same at
+        any length; it pays once the context is a few times what a query keeps.
+        """
+        if not self.gathered_keys or self.training or B != 1:
+            return False
+        if L <= DECODE_BLOCK_SIZE or S < self.gathered_min_keys:
+            return False
+        if S <= self.indexer.topk + self.indexer.window:
+            return False
+        # By name, so a server's own plain cache of the same kind qualifies;
+        # quantized and batched caches keep the dense path.
+        return latent_cache is None or type(latent_cache).__name__ == "KVCache"
+
+    def _gathered_attention(self, q_nope, q_pe, kv, k_pe, ids, usable):
+        """Attention for a single-row chunk over each query's own keys.
+
+        The per-head projections are folded into the queries, as for a decode
+        step, so keys and values are both the gathered latents. Rows go in
+        blocks to bound the gathered tensor (rows x keys x latent).
+        """
+        L = ids.shape[0]
+        q = (self.embed_q(q_nope)[0] * self.scale).transpose(1, 0, 2)
+        q_pe = (q_pe[0] * self.scale).transpose(1, 0, 2)
+        kv, k_pe = kv[0, 0], k_pe[0, 0]
+        parts = []
+        for start in range(0, L, self.gathered_rows):
+            rows = slice(start, start + self.gathered_rows)
+            keys = mx.take(kv, ids[rows], axis=0)
+            scores = q[rows] @ keys.swapaxes(-1, -2) + q_pe[rows] @ mx.take(
+                k_pe, ids[rows], axis=0
+            ).swapaxes(-1, -2)
+            weights = _attention_weights(scores, usable[rows, None], self.attn_sink)
+            parts.append(weights.astype(keys.dtype) @ keys)
+        out = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+        return self.unembed_out(out.transpose(1, 0, 2)[None])
 
 
 class DecoderLayer(nn.Module):

@@ -21,11 +21,14 @@ from ....models.base import scaled_dot_product_attention
 from ....models.cache import RotatingKVCache
 from ....models.deepseek_v4.hyper_connection import HyperHead, hc_expand
 from ....models.deepseek_v4.language import LocalAttention
+from ....models.ernie5_5_moe import decode_kernels
 from ....models.ernie5_5_moe.language import (
     HyperConnection,
     LanguageModel,
     LatentMoE,
     VirtualHeads,
+    _hc_boundary,
+    _linear,
 )
 from ..deepseek_v4_dspark.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
 from .policy import CopyIndex, DepthPolicy
@@ -58,13 +61,13 @@ class DSparkAttention(LocalAttention):
         S = x_ctx.shape[1]
         offset = cache.offset
 
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(B, L, self.n_heads, self.head_dim)
+        qr = self.q_norm(_linear(self.wq_a, x))
+        q = _linear(self.wq_b, qr).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps).transpose(0, 2, 1, 3)
         q = self.rope(q, offset + S)
 
-        ctx_kv = self.rope(self.kv_norm(self.wkv(x_ctx))[:, None], offset)
-        block_kv = self.rope(self.kv_norm(self.wkv(x))[:, None], offset + S)
+        ctx_kv = self.rope(self.kv_norm(_linear(self.wkv, x_ctx))[:, None], offset)
+        block_kv = self.rope(self.kv_norm(_linear(self.wkv, x))[:, None], offset + S)
         kv, _ = cache.update_and_fetch(
             ctx_kv, mx.zeros((B, 1, S, 0), dtype=ctx_kv.dtype)
         )
@@ -82,7 +85,7 @@ class DSparkAttention(LocalAttention):
         out = self.rope(out, offset + S, inverse=True).transpose(0, 2, 1, 3)
         out = self.vha(out).reshape(B, L, self.o_groups, -1).transpose(0, 2, 1, 3)
         out = self.wo_a(out).transpose(0, 2, 1, 3).flatten(-2)
-        return self.wo_b(out * mx.sigmoid(self.o_gate(qr)))
+        return _linear(self.wo_b, out * mx.sigmoid(_linear(self.o_gate, qr)))
 
 
 class DSparkStage(nn.Module):
@@ -110,12 +113,17 @@ class DSparkStage(nn.Module):
             self.norm = nn.RMSNorm(text.hidden_size, eps=text.rms_norm_eps)
 
     def __call__(self, h: mx.array, main_x: mx.array, cache: RotatingKVCache):
-        x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), main_x, cache)
-        h = hc_expand(x, h, post, comb)
-        x, post, comb = self.ffn_hc(h)
-        x = self.ffn(self.ffn_norm(x))
-        return hc_expand(x, h, post, comb)
+        h, pending = self.short(h, main_x, cache)
+        return hc_expand(pending[0], h, pending[1], pending[2])
+
+    def short(self, h, main_x, cache, pending=None):
+        """The stage with its last expand left to the caller, as the target's
+        ``DecoderLayer.short`` does: every expand then shares a launch with
+        the projection that follows it."""
+        h, x, post, comb = _hc_boundary(self.attn_hc, self.attn_norm, h, pending)
+        x = self.attn(x, main_x, cache)
+        h, x, post, comb = _hc_boundary(self.ffn_hc, self.ffn_norm, h, (x, post, comb))
+        return h, (self.ffn(x), post, comb)
 
 
 class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
@@ -208,6 +216,21 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         self._multimax = lm.multimax
         return self
 
+    def _hidden(self, inputs, target_hidden, cache):
+        first = self.stages[0]
+        main_x = first.main_norm(first.main_proj(target_hidden))
+        h = self._input_embed(inputs)
+        h = mx.broadcast_to(
+            h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[-1])
+        )
+        h = mx.contiguous(h)
+        pending = None
+        for stage, stage_cache in zip(self.stages, cache):
+            h, pending = stage.short(h, main_x, stage_cache, pending)
+        h = hc_expand(pending[0], h, pending[1], pending[2])
+        last = self.stages[-1]
+        return last.norm(last.hc_head(h))
+
     def _logits(self, hidden: mx.array) -> mx.array:
         return self._lm_head_fn(hidden)
 
@@ -224,17 +247,10 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
             raise RuntimeError(
                 "bind(target_model) must be called before draft_block()."
             )
-        multimax = self._multimax
         # Always run the head: it also appends the committed positions to the
         # draft context.
-        tokens = super().draft_block(
-            last_bonus,
-            hidden,
-            cache,
-            block_size,
-            lambda logits: sampler(multimax(logits)),
-            token_dtype,
-        )
+        tokens = self._draft_tokens(last_bonus, hidden, cache, block_size, sampler)
+        tokens = tokens.astype(token_dtype)
         candidate = self._copy_draft
         if candidate is None:
             return tokens
@@ -252,6 +268,48 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
             return tokens
         self.copy_rounds += 1
         return mx.array([candidate], dtype=token_dtype)
+
+    def _draft_tokens(self, last_bonus, hidden, cache, block_size, sampler):
+        """The head's proposals for one block, sampled left to right."""
+        token_dtype = mx.int32
+        proposals = int(block_size) - 1
+        if proposals <= 0:
+            batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+            return mx.zeros((batch, 0), dtype=token_dtype)
+        anchor = (
+            mx.array([last_bonus], dtype=token_dtype)
+            if isinstance(last_bonus, int)
+            else last_bonus.reshape(-1).astype(token_dtype)
+        )
+        masks = mx.full(
+            (anchor.shape[0], proposals - 1),
+            int(self.config.mask_token_id),
+            dtype=token_dtype,
+        )
+        inputs = mx.concatenate([anchor[:, None], masks], axis=1)
+        base = self._logits(self._hidden(inputs, hidden, cache))
+        head, multimax = self.markov_head, self._multimax
+        correction = head.markov_w2
+        weight = correction.get("weight") if type(correction) is nn.Linear else None
+        if weight is None or "bias" in correction or base.dtype != mx.float32:
+            return head.sample_block(
+                base,
+                first_prev_tokens=anchor,
+                sampler=lambda logits: sampler(multimax(logits)),
+            )
+        # Each step adds the Markov correction of the previous token to its
+        # base logits and applies MultiMax, in one pass over the correction.
+        shape = multimax.packed()
+        previous = anchor
+        sampled = []
+        for step in range(proposals):
+            embedded = head.get_prev_embeddings(previous).astype(mx.float32)
+            logits = decode_kernels.vocab_head(embedded, weight, shape, base[:, step])
+            if logits is None:
+                logits = multimax(head.apply_step_logits(base[:, step], previous))
+            previous = sampler(logits).reshape(-1)
+            sampled.append(previous[:, None])
+        return mx.concatenate(sampled, axis=1)
 
     def sanitize(self, weights: dict) -> dict:
         """Map draft tensors in the ERNIE layer layout onto the drafter.

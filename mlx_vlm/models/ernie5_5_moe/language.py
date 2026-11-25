@@ -40,12 +40,22 @@ from ..deepseek_v4.language import (
 )
 from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
+from . import decode_kernels
 from .config import ModelConfig
+
+
+def _linear(layer, x):
+    """A dense projection; a verify block reads the weights once for all rows."""
+    if decode_kernels.projects_block(x):
+        out = decode_kernels.fp8_linear(layer, x)
+        if out is not None:
+            return out
+    return layer(x)
 
 
 def _parallel_output(projection, x, group):
     if group is None:
-        return projection(x)
+        return _linear(projection, x)
     # Match a full dot product's accumulation before rounding back to BF16.
     out = projection(x.astype(mx.float32))
     return mx.distributed.all_sum(out, group=group).astype(x.dtype)
@@ -95,11 +105,21 @@ class MLP(nn.Module):
         self.sharding_group = None
 
     def __call__(self, x):
-        return _parallel_output(
-            self.down_proj,
-            self.activation(self.up_proj(x), self.gate_proj(x)),
-            self.sharding_group,
-        )
+        activation = self.activation
+        hidden = None
+        if (
+            decode_kernels.projects_block(x)
+            and self.sharding_group is None
+            and type(activation) is SiTU
+            and activation.output_dtype is None
+        ):
+            # Gate, up and the activation of a verify block in one weight pass.
+            hidden = decode_kernels.fp8_gate_up(
+                self.gate_proj, self.up_proj, x, activation.beta, activation.linear_beta
+            )
+        if hidden is None:
+            hidden = activation(self.up_proj(x), self.gate_proj(x))
+        return _parallel_output(self.down_proj, hidden, self.sharding_group)
 
 
 class MultiRouter(nn.Module):
@@ -198,12 +218,53 @@ class LatentMoE(nn.Module):
             and x.ndim == 3
             and x.shape[1] <= DECODE_BLOCK_SIZE
         ):
-            # Decode and verify blocks run as one compiled graph. The stacked
-            # router is prepared here because compiled code cannot evaluate.
+            # Decode and verify blocks run on the fused kernels, or failing
+            # that as one compiled graph. The stacked router is prepared here
+            # because compiled code cannot evaluate.
+            out = self._decode(x, bias) if decode_kernels.ENABLED else None
+            if out is not None:
+                return out
             if self._compiled is None:
                 self._compiled = mx.compile(self._forward, inputs=[self.state])
             return self._compiled(x, bias, self.gate.stacked())
         return self._forward(x, bias)
+
+    def _decode(self, x, bias):
+        """A decode block in seven launches besides the shared expert.
+
+        Returns None when the kernels do not cover this layer.
+        """
+        gate, switch, norm = self.gate, self.switch_mlp, self.latent_norm
+        activation = switch.activation
+        if (
+            type(activation) is not SiTU
+            or activation.output_dtype is not None
+            or type(norm) is not nn.RMSNorm
+            or self.routed_backend is not None
+        ):
+            return None
+        B, L, D = x.shape
+        rows = x.reshape(B * L, D)
+        scores = decode_kernels.router_scores(rows, gate.weight, gate.weight_1)
+        if scores is None:
+            return None
+        picked = decode_kernels.router_select(
+            scores, bias, gate.routed_scaling_factor_param, gate.top_k, gate.normalize
+        )
+        if picked is None:
+            return None
+        ids, weights = picked
+        latent = _linear(self.fc1_latent_proj, rows)
+        outputs = decode_kernels.routed_experts(
+            switch, latent, ids, activation.beta, activation.linear_beta
+        )
+        if outputs is None:
+            return None
+        combined = decode_kernels.combine_norm(outputs, weights, norm.weight, norm.eps)
+        if combined is None:
+            return None
+        routed = _linear(self.fc2_latent_proj, combined.reshape(B, L, -1))
+        return self.shared_experts(x) + routed
 
     def _forward(self, x, bias, stacked=None):
         ids, weights = self.gate(x, bias, stacked)
@@ -363,8 +424,17 @@ class HCACompressor(Compressor):
         B, _, _ = x.shape
         # The reference accumulates the compression projections and pooling
         # buffers in fp32, even for a bf16 backbone.
-        kv = x.astype(mx.float32) @ self.wkv.weight.astype(mx.float32).T
-        gate = x.astype(mx.float32) @ self.wgate.weight.astype(mx.float32).T
+        pair = None
+        if not self.training and x.shape[1] <= DECODE_BLOCK_SIZE:
+            # One launch that reads both half-precision weights in place,
+            # instead of promoting them to fp32 on every decode step.
+            pair = decode_kernels.pair_project(x, self.wkv.weight, self.wgate.weight)
+        if pair is not None:
+            kv = pair[0].reshape(B, x.shape[1], -1)
+            gate = pair[1].reshape(B, x.shape[1], -1)
+        else:
+            kv = x.astype(mx.float32) @ self.wkv.weight.astype(mx.float32).T
+            gate = x.astype(mx.float32) @ self.wgate.weight.astype(mx.float32).T
         if pool_cache is None:
             usable = kv.shape[1] // self.compress_ratio * self.compress_ratio
             kv, gate, base = kv[:, :usable], gate[:, :usable], offset
@@ -404,11 +474,11 @@ class HCAAttention(CompressedAttention):
         mask = create_attention_mask(
             x, local, window_size=self.config.sliding_window, return_array=True
         )
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr).reshape(B, L, self.n_heads, self.head_dim)
+        qr = self.q_norm(_linear(self.wq_a, x))
+        q = _linear(self.wq_b, qr).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps).transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
-        kv = self.rope(self.kv_norm(self.wkv(x))[:, None], offset)
+        kv = self.rope(self.kv_norm(_linear(self.wkv, x))[:, None], offset)
         if local is not None:
             kv, _ = local.update_and_fetch(kv, mx.zeros((B, 1, L, 0), dtype=x.dtype))
         pooled = self.compressor(x, pool, offset)
@@ -441,12 +511,24 @@ class HCAAttention(CompressedAttention):
         return self._output(out, qr, offset)
 
     def _output(self, out, qr, offset):
-        B, _, L, _ = out.shape
         out = self.rope(out, offset, inverse=True).transpose(0, 2, 1, 3)
-        out = self.vha(out).reshape(B, L, self.o_groups, -1).transpose(0, 2, 1, 3)
-        out = self.wo_a(out).transpose(0, 2, 1, 3).flatten(-2)
+        return self._project(out, qr)
+
+    def _project(self, out, qr):
+        """Mix the heads of ``out`` (B, L, heads, D) and project them out."""
+        B, L = out.shape[:2]
+        out = self.vha(out).reshape(B, L, self.o_groups, -1)
+        grouped = None
+        if decode_kernels.projects_block(out[..., 0, :]):
+            grouped = decode_kernels.fp8_grouped(self.wo_a, out)
+        if grouped is None:
+            grouped = self.wo_a(out.transpose(0, 2, 1, 3))
+            grouped = grouped.transpose(0, 2, 1, 3).flatten(-2)
+        out = grouped
         return _parallel_output(
-            self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
+            self.wo_b,
+            out * mx.sigmoid(_linear(self.o_gate, qr)),
+            self.vha.sharding_group,
         )
 
     def _banded(self, L, earlier, local, mask, pooled, pool_mask):
@@ -604,7 +686,8 @@ class Indexer(nn.Module):
         B, L, _ = x.shape
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
-        q = self.wq_b(qr).reshape(B, L, self.heads, self.dim).transpose(0, 2, 1, 3)
+        q = _linear(self.wq_b, qr).reshape(B, L, self.heads, self.dim)
+        q = q.transpose(0, 2, 1, 3)
         k = self.k_norm(self.wk(x))[:, None]
         q, k = self.rope(q, offset), self.rope(k, offset)
         # The release's orthonormal Hadamard leaves full-precision dot products
@@ -699,10 +782,11 @@ class MLAAttention(nn.Module):
         offset = latent_cache.offset if latent_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
         mask = create_attention_mask(x, latent_cache, return_array=True)
-        qr = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(qr).reshape(B, L, self.heads, -1).transpose(0, 2, 1, 3)
+        qr = self.q_a_layernorm(_linear(self.q_a_proj, x))
+        q = _linear(self.q_b_proj, qr).reshape(B, L, self.heads, -1)
+        q = q.transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.nope], axis=-1)
-        kv, k_pe = mx.split(self.kv_a_proj_with_mqa(x), [self.latent], axis=-1)
+        kv, k_pe = mx.split(_linear(self.kv_a_proj_with_mqa, x), [self.latent], axis=-1)
         kv = self.kv_a_layernorm(kv)[:, None]
         q_pe = self.rope(q_pe, offset)
         k_pe = self.rope(k_pe[:, None], offset)
@@ -715,7 +799,7 @@ class MLAAttention(nn.Module):
             out = self.vha(out.transpose(0, 2, 1, 3)).flatten(-2)
             return _parallel_output(
                 self.wo_b,
-                out * mx.sigmoid(self.o_gate(qr)),
+                out * mx.sigmoid(_linear(self.o_gate, qr)),
                 self.vha.sharding_group,
             )
         if indices is not None:
@@ -749,7 +833,9 @@ class MLAAttention(nn.Module):
             out = self.unembed_out(out)
         out = self.vha(out.transpose(0, 2, 1, 3)).flatten(-2)
         return _parallel_output(
-            self.wo_b, out * mx.sigmoid(self.o_gate(qr)), self.vha.sharding_group
+            self.wo_b,
+            out * mx.sigmoid(_linear(self.o_gate, qr)),
+            self.vha.sharding_group,
         )
 
     def _gathered(self, B, L, S, latent_cache):
@@ -799,6 +885,46 @@ class MLAAttention(nn.Module):
 _hc_expand_decode = mx.compile(hc_expand)
 
 
+def _hc_boundary(connection, norm, x, pending):
+    """Expand ``pending`` into ``x``, then collapse and normalize for a sublayer.
+
+    Returns ``(stream, normed, post, comb)``. Two launches when the kernels
+    cover the block, the composed operations otherwise.
+    """
+    weight = norm.weight if type(norm) is nn.RMSNorm else None
+    fused = (
+        weight is not None and connection.mult == 4 and mx.default_device() == mx.gpu
+    )
+    mixes = None
+    if fused and pending is not None:
+        out = decode_kernels.hc_expand_project(
+            pending[0], x, pending[1], pending[2], connection.fn, connection.norm_eps
+        )
+        if out is not None:
+            x, mixes = out
+            pending = None
+    if pending is not None:
+        x = _hc_expand_decode(pending[0], x, pending[1], pending[2])
+    if fused and mixes is None:
+        mixes = decode_kernels.hc_project(x, connection.fn, connection.norm_eps)
+    out = None
+    if mixes is not None:
+        out = decode_kernels.hc_collapse_norm(
+            x,
+            mixes,
+            connection.scale,
+            connection.base,
+            weight,
+            connection.iters,
+            connection.eps,
+            norm.eps,
+        )
+    if out is None:
+        h, post, comb = connection(x)
+        return x, norm(h), post, comb
+    return x, out[0], out[1], out[2]
+
+
 class DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -829,6 +955,19 @@ class DecoderLayer(nn.Module):
         h = self.ffn(h) if router_bias is None else self.ffn(h, router_bias)
         return expand(h, x, post, comb)
 
+    def short(self, x, cache=None, pending=None):
+        """A decode or verify block, with the last expand left to the caller.
+
+        ``pending`` is the ``(h, post, comb)`` of the sublayer before this
+        layer, not yet expanded into ``x``. Returns the stream this layer's
+        feed-forward read and its own pending expand, so that every expand
+        runs in the same launch as the projection that follows it.
+        """
+        x, h, post, comb = _hc_boundary(self.attn_hc, self.attn_norm, x, pending)
+        h = self.attn(h, cache)
+        x, h, post, comb = _hc_boundary(self.ffn_hc, self.ffn_norm, x, (h, post, comb))
+        return x, (self.ffn(h), post, comb)
+
 
 class ErnieModel(nn.Module):
     def __init__(self, config):
@@ -858,8 +997,19 @@ class ErnieModel(nn.Module):
         if len(cache) != len(self.layers):
             raise ValueError("Expected one cache per decoder layer")
         capture = set(capture_layer_ids) if capture_layer_ids else ()
+        # Decode and verify blocks carry each layer's last expand into the
+        # next layer's first projection.
+        short = not self.training and h.shape[1] <= DECODE_BLOCK_SIZE
+        last = len(self.layers) - 1
+        pending = None
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
-            h = layer(h, layer_cache)
+            if short:
+                h, pending = layer.short(h, layer_cache, pending)
+                if index in capture or index == last:
+                    h = _hc_expand_decode(pending[0], h, pending[1], pending[2])
+                    pending = None
+            else:
+                h = layer(h, layer_cache)
             if index in capture:
                 # DSpark reads each target layer's output averaged over the
                 # hyper-connection streams.
@@ -871,85 +1021,23 @@ class ErnieModel(nn.Module):
         return self.norm(self.hc_head(h))
 
 
-def _make_head_kernel():
-    """fp32 logits from a half-precision vocabulary weight.
-
-    One simdgroup per vocabulary row: each lane accumulates its share of the
-    row against up to eight hidden rows in fp32, so the weight is streamed
-    once however many rows are projected, at half the bytes of an fp32 copy.
-    """
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint row  = threadgroup_position_in_grid.x;
-        uint lane = thread_position_in_threadgroup.x;
-        constexpr uint K4 = (uint)K / 4;
-        using T4 = vec<T, 4>;
-        const device T4* w4 = (const device T4*)weight + (size_t)row * K4;
-        float acc[R];
-        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-        for (uint i = lane; i < K4; i += 32) {
-            float4 wv = float4(w4[i]);
-            for (int r = 0; r < R; ++r) {
-                acc[r] += metal::dot(
-                    wv, *(const device float4*)(hidden + (uint)r * K + 4 * i));
-            }
-        }
-        for (int r = 0; r < R; ++r) {
-            float s = simd_sum(acc[r]);
-            if (lane == 0) logits[(size_t)r * V + row] = s;
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="ernie_vocab_head",
-        input_names=["hidden", "weight"],
-        output_names=["logits"],
-        source=source,
-        ensure_row_contiguous=True,
-    )
-
-
-_head_kernel = _make_head_kernel()
-_HEAD_ROWS = 8
-
-
-def _half_precision_head(hidden, weight):
-    rows = hidden.reshape(-1, hidden.shape[-1])
-    count, width = rows.shape
-    vocab = weight.shape[0]
-    parts = []
-    for start in range(0, count, _HEAD_ROWS):
-        chunk = rows[start : start + _HEAD_ROWS]
-        kept = chunk.shape[0]
-        if kept == 1:
-            # One row runs about three times slower than two on an M5 Ultra
-            # (4.9 ms against 1.8 ms), for this kernel and for MLX's own
-            # matmul alike, so a lone row is projected twice.
-            chunk = mx.concatenate([chunk, chunk], axis=0)
-        logits = _head_kernel(
-            inputs=[chunk, weight],
-            template=[
-                ("T", weight.dtype),
-                ("K", width),
-                ("V", vocab),
-                ("R", chunk.shape[0]),
-            ],
-            grid=(vocab * 32, 1, 1),
-            threadgroup=(32, 1, 1),
-            output_shapes=[(chunk.shape[0], vocab)],
-            output_dtypes=[mx.float32],
-        )[0]
-        parts.append(logits[:kept])
-    logits = parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
-    return logits.reshape(*hidden.shape[:-1], vocab)
-
-
 class MultiMax(nn.Module):
     def __init__(self):
         super().__init__()
         self.multimax_ranges = mx.zeros((4,), dtype=mx.float32)
         self.multimax_ts = mx.zeros((4,), dtype=mx.float32)
+        self._packed_source = None
+        self._packed = None
+
+    def packed(self):
+        """Ranges then factors as one fp32 array, for the head kernel."""
+        source = (self.multimax_ranges, self.multimax_ts)
+        cached = self._packed_source
+        if cached is None or cached[0] is not source[0] or cached[1] is not source[1]:
+            self._packed = mx.concatenate(source).astype(mx.float32)
+            mx.eval(self._packed)
+            self._packed_source = source
+        return self._packed
 
     def __call__(self, logits):
         logits = logits.astype(mx.float32)
@@ -1006,29 +1094,29 @@ class LanguageModel(nn.Module):
             shared_kv_states={} if kwargs.get("return_shared_kv", False) else None,
         )
 
-    def project_head(self, hidden):
-        """Vocabulary logits in fp32, before MultiMax.
+    def project_head(self, hidden, multimax=False):
+        """Vocabulary logits in fp32, before MultiMax unless ``multimax``.
 
         The released weight is half precision and the projection is fp32. A
         plain matmul promotes all vocab_size x hidden_size values on every
-        call; the kernel reads the weight in place and accumulates in fp32.
+        call; the kernel reads the weight in place, accumulates in fp32 and
+        can apply MultiMax as it writes.
         """
         hidden = hidden.astype(mx.float32)
         head = self.lm_head
         weight = head.get("weight") if type(head) is nn.Linear else None
-        if (
-            self.training
-            or _head_kernel is None
-            or weight is None
-            or weight.dtype not in (mx.bfloat16, mx.float16)
-            or weight.shape[1] % 4
-            or mx.default_device() != mx.gpu
-        ):
-            return head(hidden)
-        return _half_precision_head(hidden, weight)
+        logits = None
+        if not self.training and weight is not None and hidden.ndim >= 2:
+            rows = hidden.reshape(-1, hidden.shape[-1])
+            shape = self.multimax.packed() if multimax else None
+            logits = decode_kernels.vocab_head(rows, weight, shape)
+        if logits is None:
+            logits = head(hidden)
+            return self.multimax(logits) if multimax else logits
+        return logits.reshape(*hidden.shape[:-1], weight.shape[0])
 
     def _project_logits(self, hidden):
-        return self.multimax(self.project_head(hidden))
+        return self.project_head(hidden, multimax=True)
 
     def speculative_logits_from_hidden(self, hidden):
         h = hidden.reshape(

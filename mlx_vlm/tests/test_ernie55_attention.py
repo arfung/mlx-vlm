@@ -90,15 +90,18 @@ def _paths():
         HCAAttention.banded_window,
         MLAAttention.gathered_keys,
         MLAAttention.gathered_min_keys,
+        MLAAttention.gathered_min_keys_short,
         MLAAttention.gathered_rows,
         language._index_kernel,
     )
     MLAAttention.gathered_min_keys = 0
+    MLAAttention.gathered_min_keys_short = 0
     yield
     (
         HCAAttention.banded_window,
         MLAAttention.gathered_keys,
         MLAAttention.gathered_min_keys,
+        MLAAttention.gathered_min_keys_short,
         MLAAttention.gathered_rows,
         language._index_kernel,
     ) = saved
@@ -265,8 +268,16 @@ def test_gathered_keys_are_taken_only_for_long_single_row_chunks(model):
     # A context no longer than what a query keeps is attended densely.
     assert not attn._gathered(1, 16, few, KVCache())
     assert not attn._gathered(2, 16, 64, KVCache())
-    assert not attn._gathered(1, language.DECODE_BLOCK_SIZE, 64, KVCache())
     assert not attn._gathered(1, 16, 64, RotatingKVCache(max_size=8))
+    # A verify block gathers from its own context length on; one decoded
+    # token takes its keys from the indexer's list instead.
+    assert attn._gathered(1, language.DECODE_BLOCK_SIZE, 64, KVCache())
+    assert attn._gathered(1, 2, 64, KVCache())
+    assert not attn._gathered(1, 1, 64, KVCache())
+    MLAAttention.gathered_min_keys_short = 65
+    assert not attn._gathered(1, language.DECODE_BLOCK_SIZE, 64, KVCache())
+    assert attn._gathered(1, language.DECODE_BLOCK_SIZE + 1, 64, KVCache())
+    MLAAttention.gathered_min_keys_short = 0
 
     class KVCache_(KVCache):
         pass

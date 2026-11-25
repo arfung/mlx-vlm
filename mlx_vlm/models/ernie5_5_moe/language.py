@@ -622,6 +622,11 @@ _INDEX_ROWS = 512
 
 
 class Indexer(nn.Module):
+    # Sum the heads' scores in one pass. The composed form makes several
+    # passes over heads x keys values, which for a decode step at 30K tokens
+    # of context costs more than the rest of the layer.
+    kernel_scores = True
+
     def __init__(self, config):
         super().__init__()
         self.heads = config.index_n_heads
@@ -648,7 +653,7 @@ class Indexer(nn.Module):
         """
         B, _, L, _ = q.shape
         S = k.shape[2]
-        if _index_kernel is None or self.training or L <= DECODE_BLOCK_SIZE:
+        if _index_kernel is None or self.training or not self.kernel_scores:
             scores = mx.maximum(q @ k.swapaxes(-1, -2), 0).astype(mx.float32)
             return (scores * weights.transpose(0, 2, 1)[..., None]).sum(
                 axis=1, keepdims=True
@@ -742,8 +747,10 @@ class Indexer(nn.Module):
 class MLAAttention(nn.Module):
     # Attend long single-row chunks over each query's selected keys only.
     gathered_keys = True
-    # Context length from which gathering beats the dense product.
+    # Context length from which gathering beats the dense product, for
+    # chunks and for verify blocks.
     gathered_min_keys = 6144
+    gathered_min_keys_short = 4096
     gathered_rows = 512
 
     def __init__(self, config):
@@ -849,7 +856,12 @@ class MLAAttention(nn.Module):
         """
         if not self.gathered_keys or self.training or B != 1:
             return False
-        if L <= DECODE_BLOCK_SIZE or S < self.gathered_min_keys:
+        # One query takes its keys through the indexer's own list; a verify
+        # block gathers like a chunk does, from a shorter context on.
+        short = L <= DECODE_BLOCK_SIZE
+        if L == 1 or S < (
+            self.gathered_min_keys_short if short else self.gathered_min_keys
+        ):
             return False
         if S <= self.indexer.topk + self.indexer.window:
             return False

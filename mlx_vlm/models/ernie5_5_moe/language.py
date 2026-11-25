@@ -51,6 +51,18 @@ def _parallel_output(projection, x, group):
     return mx.distributed.all_sum(out, group=group).astype(x.dtype)
 
 
+def _row_major(value):
+    """Store a transposed checkpoint tensor in its own row-major buffer.
+
+    A transpose is only a strided view. The hyper-connection projects its
+    16384 inputs onto 24 outputs as ``x @ fn.T``; with ``fn`` left as a view of
+    the checkpoint's (16384, 24) tensor that product takes MLX's slow
+    transposed-GEMV path, 0.38 ms instead of 0.15 ms on an M5 Ultra, 86 times
+    per decoded token.
+    """
+    return mx.contiguous(value)
+
+
 @mx.compile
 def _situ(up, gate, beta, linear_beta):
     dtype = gate.dtype
@@ -793,6 +805,9 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.multimax = MultiMax()
         self.sharding_group = None
+        # FP32 copy of a half-precision vocabulary weight, see project_head.
+        self._head_source = None
+        self._head_fp32 = None
 
     def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
         if kwargs.pop("speculative_verify", False):
@@ -827,8 +842,28 @@ class LanguageModel(nn.Module):
             shared_kv_states={} if kwargs.get("return_shared_kv", False) else None,
         )
 
+    def project_head(self, hidden):
+        """Vocabulary logits in fp32, before MultiMax.
+
+        The released weight is half precision and the projection is fp32, so a
+        plain matmul promotes all vocab_size x hidden_size values on every
+        call: about 3 GB of temporaries per decode step on ERNIE 5.5 Flash.
+        Cast the weight once instead. The product is unchanged.
+        """
+        hidden = hidden.astype(mx.float32)
+        head = self.lm_head
+        weight = head.get("weight") if type(head) is nn.Linear else None
+        if weight is None or weight.dtype not in (mx.bfloat16, mx.float16):
+            return head(hidden)
+        if self._head_source is not weight:
+            # Follows a weight reload: the copy belongs to this exact array.
+            self._head_fp32 = weight.astype(mx.float32)
+            mx.eval(self._head_fp32)
+            self._head_source = weight
+        return hidden @ self._head_fp32.T
+
     def _project_logits(self, hidden):
-        return self.multimax(self.lm_head(hidden.astype(mx.float32)))
+        return self.multimax(self.project_head(hidden))
 
     def speculative_logits_from_hidden(self, hidden):
         h = hidden.reshape(
@@ -966,7 +1001,7 @@ class LanguageModel(nn.Module):
                 raise ValueError(f"FP8 weight without its scale: {key}")
 
             if key == "model.mhc_contract.hc_head_fn":
-                value = value.T
+                value = _row_major(value.T)
             key = key.replace("model.lm_head.", "multimax.")
             key = key.replace("model.mhc_contract.hc_head_", "model.hc_head.")
             for src, dst in (("self_attention", "attn"), ("mlp", "ffn")):
@@ -975,7 +1010,7 @@ class LanguageModel(nn.Module):
                     key = key.replace(prefix, f".{dst}_hc.")
                     if key.endswith("mapping_proj.weight"):
                         key = key.replace("mapping_proj.weight", "fn")
-                        value = value.T
+                        value = _row_major(value.T)
                     key = key.replace(f".{dst}_hc.bias", f".{dst}_hc.base")
             remap = {
                 ".input_layernorm.": ".attn_norm.",
@@ -1061,7 +1096,7 @@ class LanguageModel(nn.Module):
                 w = w.reshape(attn.heads, attn.nope + attn.value_dim, attn.latent)
                 k, v = mx.split(w, [attn.nope], axis=1)
                 prefix = f"model.layers.{i}.attn."
-                weights[prefix + "embed_q.weight"] = k.swapaxes(-1, -2)
+                weights[prefix + "embed_q.weight"] = _row_major(k.swapaxes(-1, -2))
                 weights[prefix + "unembed_out.weight"] = v
         return weights
 

@@ -202,13 +202,14 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         self.validate_target_compatibility(target_model)
         lm = getattr(target_model, "language_model", target_model)
         self._input_embed = lm.model.embed_tokens
-        self._lm_head_fn = lm.lm_head
+        # The target's fp32 projection, without MultiMax: that follows the
+        # Markov bias.
+        self._lm_head_fn = lm.project_head
         self._multimax = lm.multimax
         return self
 
     def _logits(self, hidden: mx.array) -> mx.array:
-        # The target projects in fp32. MultiMax follows the Markov bias.
-        return self._lm_head_fn(hidden.astype(mx.float32))
+        return self._lm_head_fn(hidden)
 
     def draft_block(
         self,
@@ -295,7 +296,7 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         for key, value in mapped.items():
             if key == "model.markov_head.markov_w1.weight":
                 # Stored as [rank, vocab]; the embedding wants [vocab, rank].
-                value = value.T
+                value = mx.contiguous(value.T)
             if key.startswith("model.layers."):
                 key = "stages." + key.removeprefix("model.layers.")
             elif key.startswith("model.hc_head."):

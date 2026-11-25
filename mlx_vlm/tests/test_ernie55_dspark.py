@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
@@ -156,6 +157,14 @@ def test_bundled_tensors_map_onto_the_drafter():
         "stages.1.norm.weight": (hidden,),
     }
     assert out["stages.0.attn_hc.scale"].tolist() == [1.0, 2.0, 3.0]
+    # Transposed checkpoint tensors are stored row-major, not as strided views:
+    # the hyper-connection projection is several times slower on a view.
+    for key in (
+        "stages.0.attn_hc.fn",
+        "stages.1.hc_head.fn",
+        "markov_head.markov_w1.weight",
+    ):
+        assert np.asarray(out[key]).flags["C_CONTIGUOUS"], key
     assert out["stages.1.ffn.switch_mlp.gate_proj.weight"][1, 0, 0].item() == 1.0
     # Already-mapped weights pass through unchanged.
     assert ernie5_5_dspark.Model.sanitize(context, out) is out
@@ -225,6 +234,37 @@ def test_drafter_rejects_a_mismatched_target():
         assert "incompatible" in str(error)
     else:
         raise AssertionError("expected an incompatible target to be rejected")
+
+
+def test_project_head_casts_a_half_precision_weight_once():
+    _, model = _target()
+    lm = model.language_model
+    weight = lm.lm_head.weight.astype(mx.bfloat16)
+    lm.lm_head.weight = weight
+    hidden = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+
+    # The same product as promoting the weight on every call.
+    expected = hidden.astype(mx.float32) @ weight.astype(mx.float32).T
+    assert mx.array_equal(lm.project_head(hidden), expected)
+    assert lm._head_fp32.dtype == mx.float32
+    copy = lm._head_fp32
+    lm.project_head(hidden)
+    assert lm._head_fp32 is copy
+    # The copy is not a parameter, so it is neither saved nor counted.
+    assert not any("_head_fp32" in name for name, _ in tree_flatten(model.parameters()))
+
+    # A reloaded weight gets a fresh copy.
+    lm.lm_head.weight = (weight.astype(mx.float32) * 2).astype(mx.bfloat16)
+    assert mx.array_equal(lm.project_head(hidden), 2 * expected)
+    assert mx.array_equal(lm._project_logits(hidden), lm.multimax(2 * expected))
+
+
+def test_project_head_leaves_a_float32_weight_alone():
+    _, model = _target()
+    lm = model.language_model
+    hidden = mx.random.normal((1, 2, 64))
+    assert mx.array_equal(lm.project_head(hidden), lm.lm_head(hidden))
+    assert lm._head_fp32 is None
 
 
 def test_depth_policy_follows_acceptance():

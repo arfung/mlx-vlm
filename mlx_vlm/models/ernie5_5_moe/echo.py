@@ -38,7 +38,7 @@ def extract_echo_weights(weights, config):
                 out[name] = value
             elif name in ECHO_WEIGHT_NAMES:
                 out[ECHO_WEIGHT_NAMES[name]] = (
-                    value.T if name == "hc_head_fn" else value
+                    mx.contiguous(value.T) if name == "hc_head_fn" else value
                 )
     return out
 

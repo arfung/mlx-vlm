@@ -82,7 +82,7 @@ class Ernie55MTPDraftModel(EchoWeights):
         # Prefill and accepted-prefix replay need every KV update, but only the
         # last position seeds the next proposal. Avoid a prompt-wide vocab head.
         out = self.norm(self.hc_head(h[:, -1:]))
-        logits = self._target.multimax(self._target.lm_head(out.astype(mx.float32)))
+        logits = self._target._project_logits(out)
         return logits, h.flatten(-2)
 
     def _seed(self, logits, hidden, sampler, greedy):

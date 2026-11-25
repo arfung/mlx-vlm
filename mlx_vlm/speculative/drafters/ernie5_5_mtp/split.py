@@ -11,6 +11,20 @@ class Ernie55MTPSplitter(MTPSplitter):
     output_model_type = "ernie5_5_mtp"
     block_size_extra = 2
 
+    @classmethod
+    def from_config(cls, source_config: dict):
+        # The Preview bundles a DSpark head instead of the Base model's ECHO.
+        from ..ernie5_5_dspark.split import Ernie55DsparkSplitter
+
+        text_config = source_config.get("text_config") or source_config
+        if (
+            source_config.get("model_type") == Ernie55DsparkSplitter.output_model_type
+            or text_config.get("dspark_target_layer_ids")
+            or source_config.get("dspark_target_layer_ids")
+        ):
+            return Ernie55DsparkSplitter()
+        return cls()
+
     def select_keys(self, key, text_config):
         key = key.removeprefix("language_model.")
         prefix = f"model.layers.{text_config.get('num_hidden_layers', 43)}."

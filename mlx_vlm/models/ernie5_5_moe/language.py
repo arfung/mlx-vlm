@@ -480,6 +480,8 @@ class ErnieModel(nn.Module):
         inputs_embeds=None,
         hidden_sink=None,
         skip_final_norm=False,
+        capture_layer_ids=None,
+        capture_sink=None,
     ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
@@ -489,8 +491,13 @@ class ErnieModel(nn.Module):
             cache = [None] * len(self.layers)
         if len(cache) != len(self.layers):
             raise ValueError("Expected one cache per decoder layer")
-        for layer, layer_cache in zip(self.layers, cache):
+        capture = set(capture_layer_ids) if capture_layer_ids else ()
+        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             h = layer(h, layer_cache)
+            if index in capture:
+                # DSpark reads each target layer's output averaged over the
+                # hyper-connection streams.
+                capture_sink.append(h.mean(axis=2))
         if hidden_sink is not None:
             hidden_sink.append(h.flatten(-2))
         if skip_final_norm:
@@ -527,7 +534,15 @@ class LanguageModel(nn.Module):
         self.sharding_group = None
 
     def __call__(self, inputs=None, cache=None, inputs_embeds=None, **kwargs):
+        if kwargs.pop("speculative_verify", False):
+            from ...speculative.common import verify_forward
+
+            output, transaction = verify_forward(self, inputs, cache, **kwargs)
+            output.gdn_states = transaction
+            return output
         hidden_sink = [] if kwargs.get("return_hidden", False) else None
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        capture_sink = [] if capture_layer_ids else None
         skip_logits = kwargs.get("skip_logits", False)
         h = self.model(
             inputs,
@@ -535,6 +550,8 @@ class LanguageModel(nn.Module):
             inputs_embeds,
             hidden_sink=hidden_sink,
             skip_final_norm=skip_logits,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=capture_sink,
         )
         # The upstream model computes the vocabulary projection and MultiMax
         # in fp32, independently of the backbone dtype.
@@ -545,7 +562,7 @@ class LanguageModel(nn.Module):
         )
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=capture_sink if capture_sink is not None else hidden_sink,
             shared_kv_states={} if kwargs.get("return_shared_kv", False) else None,
         )
 

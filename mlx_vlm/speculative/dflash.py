@@ -36,6 +36,10 @@ def _dflash_next_block_size(
     block_total = min(requested_block_total, remaining_budget)
     if block_total <= 1:
         return block_total
+    choose = getattr(draft_model, "choose_next_block_size", None)
+    if callable(choose):
+        # The drafter keeps its own policy (ERNIE 5.5 DSpark).
+        return max(2, min(block_total, int(choose(block_total))))
     if getattr(draft_model, "prefer_requested_block_size", False):
         return block_total
 

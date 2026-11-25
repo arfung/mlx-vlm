@@ -3,14 +3,16 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
 from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
-from mlx_vlm.speculative.dflash import _dflash_rounds
+from mlx_vlm.speculative.dflash import _dflash_next_block_size, _dflash_rounds
 from mlx_vlm.speculative.drafters import (
     DRAFTER_KIND_BY_MODEL_TYPE,
     ernie5_5_dspark,
 )
+from mlx_vlm.speculative.drafters.ernie5_5_dspark.policy import CopyIndex, DepthPolicy
 from mlx_vlm.speculative.drafters.ernie5_5_dspark.split import (
     Ernie55DsparkSplitter,
     unbundle,
@@ -170,7 +172,7 @@ def _decode_one_by_one(model, prompt, count):
     return tokens
 
 
-def _decode_speculative(model, draft, prompt, count, block_size):
+def _decode_speculative(model, draft, prompt, count, block_size, history=None):
     lm = model.language_model
     cache = model.make_cache()
     output = lm(
@@ -180,6 +182,8 @@ def _decode_speculative(model, draft, prompt, count, block_size):
     )
     hidden = mx.concatenate(output.hidden_states, axis=-1)
     tokens = [_greedy(output.logits[:, -1]).item()]
+    draft.begin_request(history)
+    draft.observe(tokens[0])
     for token, _ in _dflash_rounds(
         model,
         draft,
@@ -193,6 +197,7 @@ def _decode_speculative(model, draft, prompt, count, block_size):
         use_model_initial_block_size=False,
     ):
         tokens.append(int(token))
+        draft.observe(int(token))
     return tokens
 
 
@@ -220,3 +225,121 @@ def test_drafter_rejects_a_mismatched_target():
         assert "incompatible" in str(error)
     else:
         raise AssertionError("expected an incompatible target to be rejected")
+
+
+def test_depth_policy_follows_acceptance():
+    policy = DepthPolicy(7)
+    start = policy.proposals()
+    assert 2 <= start <= 4
+    # Whole blocks accepted: the policy drafts deeper, up to the block.
+    for _ in range(40):
+        drafted = policy.proposals()
+        policy.update(drafted, drafted)
+    assert policy.proposals() == 7
+    assert policy.proposals(3) == 3
+    # Nothing accepted: it falls back to a single proposal.
+    for _ in range(40):
+        policy.update(0, policy.proposals())
+    assert policy.proposals() == 1
+    # Reaching a depth implies reaching the one before it.
+    assert all(a >= b for a, b in zip(policy.reach, policy.reach[1:]))
+
+
+def test_depth_policy_settles_where_a_proposal_stops_paying():
+    # The first proposal is always accepted and the second never is.
+    policy = DepthPolicy(7)
+    drafted = []
+    for _ in range(300):
+        drafted.append(policy.proposals())
+        policy.update(1, drafted[-1])
+    settled = drafted[100:]
+    # A fully accepted one-token block keeps suggesting a second proposal, so
+    # it is retried, but it never drafts deeper than that.
+    assert max(settled) <= 2
+    assert settled.count(1) > 0
+
+
+def test_copy_index_continues_an_earlier_occurrence():
+    index = CopyIndex(order=3)
+    index.extend([1, 2, 3, 4, 5, 6, 7, 8])
+    assert index.continuation(4) == []
+    index.extend([9, 2, 3, 4])
+    # "2 3 4" was followed by "5 6 7 8 9 ..." the first time.
+    assert index.continuation(3) == [5, 6, 7]
+    assert index.continuation(10) == [5, 6, 7, 8, 9, 2, 3, 4]
+    index.append(5)
+    assert index.continuation(2) == [6, 7]
+    index.append(40)
+    assert index.continuation(2) == []
+
+
+def test_copy_index_needs_a_full_window():
+    index = CopyIndex(order=6)
+    index.extend([1, 2, 3, 1, 2, 3])
+    assert index.continuation(4) == []
+
+
+@pytest.mark.parametrize("adaptive,copy", [(True, False), (True, True), (False, True)])
+def test_drafting_policies_do_not_change_greedy_output(adaptive, copy):
+    """Depth and copy drafts only choose what is verified, never what is emitted."""
+    config, model = _target()
+    # A prompt that repeats itself, so copy candidates exist.
+    prompt = [5, 9, 2, 44, 7, 81, 3, 5, 9, 2, 44, 7, 81, 3, 5, 9, 2, 44, 7, 81]
+    reference = _decode_one_by_one(model, prompt, 30)
+    draft = _drafter(config, 8)
+    draft.adaptive_depth = adaptive
+    draft.copy_drafts = copy
+    tokens = _decode_speculative(
+        model, draft, prompt, 30, 8, history=prompt if copy else None
+    )
+    assert tokens == reference
+    assert all(1 <= n <= 7 for n in draft.draft_lens)
+    if not adaptive and not copy:
+        assert set(draft.draft_lens) == {7}
+
+
+def _head_draft(draft, anchor, hidden, cache, block_size):
+    """What the head drafts on its own, with copy drafting switched off."""
+    saved, draft._copy_draft = draft._copy_draft, None
+    try:
+        return draft.draft_block(anchor, hidden, cache, block_size, _greedy)
+    finally:
+        draft._copy_draft = saved
+
+
+def test_copy_draft_is_used_only_when_the_head_agrees():
+    config, model = _target()
+    draft = _drafter(config, 8)
+    draft.reset(model)
+    draft.begin_request([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6])
+    block = draft.choose_next_block_size(8)
+    assert block == 8
+    assert draft._copy_draft == [7, 8, 9, 10, 11, 12, 1]
+
+    hidden = mx.random.normal((1, 1, 2 * 64))
+    cache = draft.make_cache()
+    head_tokens = _head_draft(draft, 6, hidden, cache, 8)
+    cache = draft.make_cache()
+    tokens = draft.draft_block(6, hidden, cache, 8, _greedy)
+    if head_tokens[0, 0].item() == 7:
+        assert tokens.tolist() == [[7, 8, 9, 10, 11, 12, 1]]
+        assert draft.copy_rounds == 1
+    else:
+        assert tokens.tolist() == head_tokens.tolist()
+        assert draft.copy_rounds == 0
+        assert draft._copy_draft is None
+
+
+def test_round_loop_asks_the_drafter_for_its_block_size():
+    class Chooser:
+        prefer_requested_block_size = True
+
+        def choose_next_block_size(self, block_total):
+            return 5
+
+    assert _dflash_next_block_size(Chooser(), 8, 100) == 5
+    assert _dflash_next_block_size(Chooser(), 4, 100) == 4
+    assert _dflash_next_block_size(Chooser(), 8, 3) == 3
+    # Without the hook the stock behaviour is unchanged.
+    stock = SimpleNamespace(prefer_requested_block_size=True)
+    assert _dflash_next_block_size(stock, 8, 100) == 8

@@ -28,6 +28,7 @@ from ....models.ernie5_5_moe.language import (
     VirtualHeads,
 )
 from ..deepseek_v4_dspark.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
+from .policy import CopyIndex, DepthPolicy
 
 # Draft-level tensors named outside the per-layer ERNIE layout.
 _HEAD_RENAMES = {
@@ -120,9 +121,70 @@ class DSparkStage(nn.Module):
 class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
     stage_class = DSparkStage
 
+    # Draft depth follows acceptance; set False to always draft the full block.
+    adaptive_depth = True
+    # Draft from an earlier occurrence when the reply repeats the request.
+    copy_drafts = True
+
     def __init__(self, config):
         super().__init__(config)
         self._multimax = None
+        self._policy = None
+        self._policy_rounds = 0
+        self._copy = None
+        self._copy_draft = None
+        self.copy_rounds = 0
+        self.copy_accepted = 0
+
+    # -- per-request state ---------------------------------------------------
+
+    def begin_request(self, prompt_tokens=None):
+        """Start a request. ``prompt_tokens`` enables context-copy drafts."""
+        self._copy = None
+        self._copy_draft = None
+        if prompt_tokens is not None and self.copy_drafts:
+            self._copy = CopyIndex()
+            self._copy.extend(prompt_tokens)
+
+    def observe(self, token):
+        """Record a committed token (the first one and every emitted one)."""
+        if self._copy is not None:
+            self._copy.append(int(token))
+
+    def reset(self, target_model):
+        cache = super().reset(target_model)
+        self._policy = DepthPolicy(max(1, int(self.config.block_size) - 1))
+        self._policy_rounds = 0
+        self._copy_draft = None
+        self.copy_rounds = 0
+        self.copy_accepted = 0
+        return cache
+
+    def choose_next_block_size(self, block_total: int) -> int:
+        """Block (anchor + proposals) for the next round."""
+        limit = max(1, int(block_total) - 1)
+        policy = self._policy
+        if policy is None:
+            return block_total
+        # Fold in the rounds verified since the last call.
+        for accepted, drafted in zip(
+            self.accept_lens[self._policy_rounds :],
+            self.draft_lens[self._policy_rounds :],
+        ):
+            if self._copy_draft is not None:
+                self.copy_accepted += int(accepted)
+            else:
+                policy.update(int(accepted), int(drafted))
+        self._policy_rounds = len(self.accept_lens)
+        self._copy_draft = None
+        if self._copy is not None:
+            candidate = self._copy.continuation(limit)
+            if candidate:
+                self._copy_draft = candidate
+                return len(candidate) + 1
+        if not self.adaptive_depth:
+            return block_total
+        return policy.proposals(limit) + 1
 
     def validate_target_compatibility(self, target_model):
         target = getattr(target_model, "language_model", target_model)
@@ -162,7 +224,9 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
                 "bind(target_model) must be called before draft_block()."
             )
         multimax = self._multimax
-        return super().draft_block(
+        # Always run the head: it also appends the committed positions to the
+        # draft context.
+        tokens = super().draft_block(
             last_bonus,
             hidden,
             cache,
@@ -170,6 +234,23 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
             lambda logits: sampler(multimax(logits)),
             token_dtype,
         )
+        candidate = self._copy_draft
+        if candidate is None:
+            return tokens
+        proposals = int(block_size) - 1
+        anchor = last_bonus if isinstance(last_bonus, int) else None
+        if (
+            tokens.shape[0] != 1
+            or len(candidate) != proposals
+            or (anchor is not None and self._copy.tokens[-1] != anchor)
+            or tokens[0, 0].item() != candidate[0]
+        ):
+            # The head disagrees on the next token, so this is not a verbatim
+            # run. Its own draft is verified instead.
+            self._copy_draft = None
+            return tokens
+        self.copy_rounds += 1
+        return mx.array([candidate], dtype=token_dtype)
 
     def sanitize(self, weights: dict) -> dict:
         """Map draft tensors in the ERNIE layer layout onto the drafter.

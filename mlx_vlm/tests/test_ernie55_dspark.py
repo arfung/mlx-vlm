@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
+from mlx_vlm.models.deepseek_v4 import hyper_connection
 from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
 from mlx_vlm.speculative.dflash import _dflash_next_block_size, _dflash_rounds
 from mlx_vlm.speculative.drafters import (
@@ -223,6 +224,26 @@ def test_dspark_rounds_reproduce_greedy_decoding():
         assert tokens == reference
         assert len(draft.accept_lens) > 0
         assert all(0 <= n <= block_size - 1 for n in draft.accept_lens)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+def test_collapse_kernel_reads_parameters_of_any_float_type(dtype):
+    """A model cast to half precision hands the kernel half-precision factors."""
+    if hyper_connection._hc_sinkhorn_collapse_kernel is None:
+        pytest.skip("needs the GPU kernel")
+    mx.random.seed(3)
+    x = (mx.random.normal((1, 3, 4, 64)) * 0.5).astype(mx.bfloat16)
+    mixes = mx.random.normal((1, 3, 24))
+    scale = mx.array([1.1, 0.9, 1.2]).astype(dtype)
+    base = (mx.random.normal((24,)) * 0.5).astype(dtype)
+    want = hyper_connection._hc_ops(
+        x, x.astype(mx.float32), mixes, scale, base, 4, 20, 1e-6
+    )
+    got = hyper_connection._hc_kernel(x, None, mixes, scale, base, 4, 20, 1e-6)
+    for kernel, ops in zip(got, want):
+        assert mx.allclose(
+            kernel.astype(mx.float32), ops.astype(mx.float32), atol=2e-2, rtol=2e-2
+        )
 
 
 def test_drafter_rejects_a_mismatched_target():

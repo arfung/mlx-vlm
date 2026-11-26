@@ -290,8 +290,15 @@ def hc_split_sinkhorn(mixes, scale, base, hc_mult, sinkhorn_iters, eps):
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
+    # The kernel reads the factors as fp32; a model cast to half precision
+    # holds them in its own type, and reading those as fp32 runs past the end.
     return _hc_sinkhorn_collapse_kernel(
-        inputs=[x, mixes, scale, base],
+        inputs=[
+            x,
+            mixes.astype(mx.float32),
+            scale.astype(mx.float32),
+            base.astype(mx.float32),
+        ],
         template=[
             ("T", x.dtype),
             ("U", x.dtype),

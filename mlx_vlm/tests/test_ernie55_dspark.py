@@ -248,13 +248,32 @@ def test_only_decode_and_verify_blocks_hand_layers_over(monkeypatch):
     model.eval()
     lm = model.language_model
     handed = []
-    monkeypatch.setattr(language, "_submit", lambda index, *arrays: handed.append(index))
+    monkeypatch.setattr(language, "_submit", lambda index, caches, *arrays: handed.append(index))
     cache = model.make_cache()
     wide = language.DECODE_BLOCK_SIZE + 1
     mx.eval(lm(mx.array([[3 + i for i in range(wide)]]), cache=cache).logits)
     assert handed == []
     mx.eval(lm(mx.array([[40, 41]]), cache=cache).logits)
     assert handed == list(range(len(lm.model.layers)))
+
+
+def test_a_layer_is_handed_over_with_its_cache_state(monkeypatch):
+    """A cache update left lazy keeps every earlier step's Metal event alive."""
+    config, model = _target()
+    model.eval()
+    lm = model.language_model
+    cache = model.make_cache()
+    mx.eval(lm(mx.array([[5, 9, 2, 44]]), cache=cache).logits)
+    calls = []
+    monkeypatch.setattr(mx, "async_eval", lambda *args: calls.append(args))
+    logits = lm(mx.array([[40, 41]]), cache=cache).logits
+    monkeypatch.undo()
+    mx.eval(logits)
+    assert len(calls) == len(lm.model.layers)
+    for (arrays, states), layer_cache in zip(calls, cache):
+        assert arrays and all(isinstance(a, mx.array) for a in arrays)
+        want = len(tree_flatten(layer_cache.state))
+        assert want and len(tree_flatten(states)) == want
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])

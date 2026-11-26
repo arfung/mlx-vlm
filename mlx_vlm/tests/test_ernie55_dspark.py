@@ -9,7 +9,7 @@ import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
 from mlx_vlm.models.deepseek_v4 import hyper_connection
-from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig
+from mlx_vlm.models.ernie5_5_moe import Model, ModelConfig, language
 from mlx_vlm.speculative.dflash import _dflash_next_block_size, _dflash_rounds
 from mlx_vlm.speculative.drafters import (
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -224,6 +224,37 @@ def test_dspark_rounds_reproduce_greedy_decoding():
         assert tokens == reference
         assert len(draft.accept_lens) > 0
         assert all(0 <= n <= block_size - 1 for n in draft.accept_lens)
+
+
+@pytest.mark.parametrize("rows", [1, 4])
+def test_layers_handed_to_the_gpu_as_they_are_built_change_nothing(rows, monkeypatch):
+    config, model = _target()
+    model.eval()
+    lm = model.language_model
+    prompt = mx.array([[5, 9, 2, 44, 7, 81, 3, 12]])
+    block = mx.array([[21 + i for i in range(rows)]])
+    logits = []
+    for every in (0, 1):
+        monkeypatch.setattr(language, "SUBMIT_LAYERS", every)
+        cache = model.make_cache()
+        mx.eval(lm(prompt, cache=cache).logits)
+        logits.append(lm(block, cache=cache).logits)
+        mx.eval(logits[-1])
+    assert mx.array_equal(logits[0], logits[1])
+
+
+def test_only_decode_and_verify_blocks_hand_layers_over(monkeypatch):
+    config, model = _target()
+    model.eval()
+    lm = model.language_model
+    handed = []
+    monkeypatch.setattr(language, "_submit", lambda index, *arrays: handed.append(index))
+    cache = model.make_cache()
+    wide = language.DECODE_BLOCK_SIZE + 1
+    mx.eval(lm(mx.array([[3 + i for i in range(wide)]]), cache=cache).logits)
+    assert handed == []
+    mx.eval(lm(mx.array([[40, 41]]), cache=cache).logits)
+    assert handed == list(range(len(lm.model.layers)))
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])

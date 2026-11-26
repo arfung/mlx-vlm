@@ -44,6 +44,18 @@ from . import decode_kernels
 from .config import ModelConfig
 
 
+# Decode and verify blocks hand each layer to the GPU as it is built. Building
+# the whole forward first leaves the GPU idle for about 5 ms of the 23 to 44
+# ms a block takes. 0 turns it off.
+SUBMIT_LAYERS = 1
+
+
+def _submit(index, *arrays):
+    """Start the GPU on the layers built so far."""
+    if SUBMIT_LAYERS and (index + 1) % SUBMIT_LAYERS == 0:
+        mx.async_eval(*[a for a in arrays if isinstance(a, mx.array)])
+
+
 def _linear(layer, x):
     """A dense projection; a verify block reads the weights once for all rows."""
     if decode_kernels.projects_block(x):
@@ -1098,7 +1110,9 @@ class ErnieModel(nn.Module):
                 if index in capture or index == last:
                     h = _hc_expand_decode(pending[0], h, pending[1], pending[2])
                     pending = None
+                _submit(index, h, *(pending or ()))
             else:
+                # A prefill chunk does not gain from it (1,575 against 1,637 tok/s).
                 h = layer(h, layer_cache)
             if index in capture:
                 # DSpark reads each target layer's output averaged over the
@@ -1132,6 +1146,7 @@ class ErnieModel(nn.Module):
             if index in capture or index == last:
                 h = _hc_expand_decode(pending[0], h, pending[1], pending[2])
                 pending = None
+            _submit(index, h, *(pending or ()))
             if index in capture:
                 capture_sink.append(h.mean(axis=2))
         return h

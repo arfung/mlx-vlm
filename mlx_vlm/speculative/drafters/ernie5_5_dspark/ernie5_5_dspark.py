@@ -57,22 +57,48 @@ class DSparkAttention(LocalAttention):
         self.vha = VirtualHeads(self.n_heads, config.vha_rank)
 
     def __call__(self, x: mx.array, x_ctx: mx.array, cache: RotatingKVCache):
-        B, L, _ = x.shape
-        S = x_ctx.shape[1]
-        offset = cache.offset
+        qr, q, block_kv = self._queries(x)
+        out = self._attend(q, self._context(x_ctx), block_kv, cache)
+        return self._project(out, qr)
 
+    def rows(self, x, x_ctx, caches, bounds, ctx_bounds):
+        """Several requests' blocks, laid end to end in ``x`` (1, N, D).
+
+        ``bounds[r]`` is where request ``r``'s rows lie in ``x``,
+        ``ctx_bounds[r]`` where its context lies in ``x_ctx`` and
+        ``caches[r]`` is its own cache. The projections read their weights
+        once for all the rows; each request attends over its own context.
+        """
+        qr, q, block_kv = self._queries(x)
+        ctx_kv = self._context(x_ctx)
+        out = [
+            self._attend(q[:, s:e], ctx_kv[:, cs:ce], block_kv[:, s:e], cache)
+            for cache, (s, e), (cs, ce) in zip(caches, bounds, ctx_bounds)
+        ]
+        return self._project(mx.concatenate(out, axis=1), qr)
+
+    def _context(self, x_ctx):
+        return self.kv_norm(_linear(self.wkv, x_ctx))
+
+    def _queries(self, x):
+        """The projections that need no position: ``(qr, q, block_kv)``."""
+        B, L, _ = x.shape
         qr = self.q_norm(_linear(self.wq_a, x))
         q = _linear(self.wq_b, qr).reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps).transpose(0, 2, 1, 3)
-        q = self.rope(q, offset + S)
+        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
+        return qr, q, self.kv_norm(_linear(self.wkv, x))
 
-        ctx_kv = self.rope(self.kv_norm(_linear(self.wkv, x_ctx))[:, None], offset)
-        block_kv = self.rope(self.kv_norm(_linear(self.wkv, x))[:, None], offset + S)
+    def _attend(self, q, ctx_kv, block_kv, cache):
+        """One request's rows over its own context: (B, L, heads, head_dim)."""
+        B, S = ctx_kv.shape[:2]
+        offset = cache.offset
+        q = self.rope(q.transpose(0, 2, 1, 3), offset + S)
+        ctx_kv = self.rope(ctx_kv[:, None], offset)
+        block_kv = self.rope(block_kv[:, None], offset + S)
         kv, _ = cache.update_and_fetch(
             ctx_kv, mx.zeros((B, 1, S, 0), dtype=ctx_kv.dtype)
         )
         kv = mx.concatenate([kv, block_kv], axis=2)
-
         out = scaled_dot_product_attention(
             q,
             kv,
@@ -82,7 +108,11 @@ class DSparkAttention(LocalAttention):
             mask=None,
             sinks=self.attn_sink.astype(q.dtype),
         )
-        out = self.rope(out, offset + S, inverse=True).transpose(0, 2, 1, 3)
+        return self.rope(out, offset + S, inverse=True).transpose(0, 2, 1, 3)
+
+    def _project(self, out, qr):
+        """Mix the heads of ``out`` (B, L, heads, D) and project them out."""
+        B, L = out.shape[:2]
         out = self.vha(out).reshape(B, L, self.o_groups, -1).transpose(0, 2, 1, 3)
         out = self.wo_a(out).transpose(0, 2, 1, 3).flatten(-2)
         return _linear(self.wo_b, out * mx.sigmoid(_linear(self.o_gate, qr)))
@@ -116,12 +146,16 @@ class DSparkStage(nn.Module):
         h, pending = self.short(h, main_x, cache)
         return hc_expand(pending[0], h, pending[1], pending[2])
 
-    def short(self, h, main_x, cache, pending=None):
+    def short(self, h, main_x, cache, pending=None, bounds=None, ctx_bounds=None):
         """The stage with its last expand left to the caller, as the target's
         ``DecoderLayer.short`` does: every expand then shares a launch with
-        the projection that follows it."""
+        the projection that follows it. With ``bounds``, ``h`` holds several
+        requests' rows and ``cache`` is one cache for each of them."""
         h, x, post, comb = _hc_boundary(self.attn_hc, self.attn_norm, h, pending)
-        x = self.attn(x, main_x, cache)
+        if bounds is None:
+            x = self.attn(x, main_x, cache)
+        else:
+            x = self.attn.rows(x, main_x, cache, bounds, ctx_bounds)
         h, x, post, comb = _hc_boundary(self.ffn_hc, self.ffn_norm, h, (x, post, comb))
         return h, (self.ffn(x), post, comb)
 
@@ -254,7 +288,7 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         self._multimax = lm.multimax
         return self
 
-    def _hidden(self, inputs, target_hidden, cache):
+    def _hidden(self, inputs, target_hidden, cache, bounds=None, ctx_bounds=None):
         first = self.stages[0]
         main_x = first.main_norm(first.main_proj(target_hidden))
         h = self._input_embed(inputs)
@@ -262,9 +296,14 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
             h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[-1])
         )
         h = mx.contiguous(h)
+        # With ``bounds``, ``cache`` holds one cache per request; a stage
+        # then takes its own cache of every request.
+        stage_caches = cache if bounds is None else zip(*cache)
         pending = None
-        for stage, stage_cache in zip(self.stages, cache):
-            h, pending = stage.short(h, main_x, stage_cache, pending)
+        for stage, stage_cache in zip(self.stages, stage_caches):
+            h, pending = stage.short(
+                h, main_x, stage_cache, pending, bounds, ctx_bounds
+            )
         h = hc_expand(pending[0], h, pending[1], pending[2])
         last = self.stages[-1]
         return last.norm(last.hc_head(h))
@@ -280,14 +319,19 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         block_size: int,
         sampler: Callable[[mx.array], mx.array],
         token_dtype: mx.Dtype = mx.int32,
+        base: mx.array = None,
     ) -> mx.array:
+        """Proposals for one block. ``base`` is this request's share of a
+        ``draft_block_bases`` forward, which then is not run again."""
         if self._multimax is None:
             raise RuntimeError(
                 "bind(target_model) must be called before draft_block()."
             )
         # Always run the head: it also appends the committed positions to the
         # draft context.
-        tokens = self._draft_tokens(last_bonus, hidden, cache, block_size, sampler)
+        tokens = self._draft_tokens(
+            last_bonus, hidden, cache, block_size, sampler, base
+        )
         tokens = tokens.astype(token_dtype)
         candidate = self._copy_draft
         if candidate is None:
@@ -307,7 +351,54 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
         self.copy_rounds += 1
         return mx.array([candidate], dtype=token_dtype)
 
-    def _draft_tokens(self, last_bonus, hidden, cache, block_size, sampler):
+    def _inputs(self, anchor, proposals):
+        """The anchor of each row followed by the masks it drafts into."""
+        masks = mx.full(
+            (anchor.shape[0], proposals - 1),
+            int(self.config.mask_token_id),
+            dtype=anchor.dtype,
+        )
+        return mx.concatenate([anchor[:, None], masks], axis=1)
+
+    def draft_block_bases(self, anchors, hiddens, caches, block_sizes):
+        """The head's logits for several requests' blocks, from one forward.
+
+        Request ``r`` drafts ``block_sizes[r] - 1`` proposals after the token
+        ``anchors[r]``, reading ``hiddens[r]`` into its own ``caches[r]``.
+        The rows of all the requests go through the stages and the vocabulary
+        head together; only the attention is per request. Returns one
+        (1, proposals, vocab) array for each request, to pass to
+        ``draft_block`` as ``base``, and ``None`` for a request that drafts
+        nothing.
+        """
+        bases = [None] * len(block_sizes)
+        live = [r for r, size in enumerate(block_sizes) if int(size) > 1]
+        if not live:
+            return bases
+        inputs, bounds, ctx_bounds = [], [], []
+        start = ctx_start = 0
+        for r in live:
+            proposals = int(block_sizes[r]) - 1
+            anchor = mx.array([int(anchors[r])], dtype=mx.int32)
+            inputs.append(self._inputs(anchor, proposals))
+            bounds.append((start, start + proposals))
+            start += proposals
+            length = hiddens[r].shape[1]
+            ctx_bounds.append((ctx_start, ctx_start + length))
+            ctx_start += length
+        hidden = self._hidden(
+            mx.concatenate(inputs, axis=1),
+            mx.concatenate([hiddens[r] for r in live], axis=1),
+            [caches[r] for r in live],
+            bounds,
+            ctx_bounds,
+        )
+        logits = self._logits(hidden)
+        for r, (s, e) in zip(live, bounds):
+            bases[r] = logits[:, s:e]
+        return bases
+
+    def _draft_tokens(self, last_bonus, hidden, cache, block_size, sampler, base=None):
         """The head's proposals for one block, sampled left to right."""
         token_dtype = mx.int32
         proposals = int(block_size) - 1
@@ -319,13 +410,9 @@ class Ernie55DsparkDraftModel(DeepseekV4DsparkDraftModel):
             if isinstance(last_bonus, int)
             else last_bonus.reshape(-1).astype(token_dtype)
         )
-        masks = mx.full(
-            (anchor.shape[0], proposals - 1),
-            int(self.config.mask_token_id),
-            dtype=token_dtype,
-        )
-        inputs = mx.concatenate([anchor[:, None], masks], axis=1)
-        base = self._logits(self._hidden(inputs, hidden, cache))
+        if base is None:
+            inputs = self._inputs(anchor, proposals)
+            base = self._logits(self._hidden(inputs, hidden, cache))
         head, multimax = self.markov_head, self._multimax
         correction = head.markov_w2
         weight = correction.get("weight") if type(correction) is nn.Linear else None

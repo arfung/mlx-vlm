@@ -545,3 +545,82 @@ def test_depth_floor_makes_a_proposal_earn_more():
     assert policy.proposals() == 4
     assert policy.proposals(floor=0.3) == 3
     assert policy.proposals(floor=0.6) == 1
+
+
+def _target_hiddens(config, lengths, seed):
+    mx.random.seed(seed)
+    width = config["hidden_size"] * 2  # two target layers feed the drafter
+    return [mx.random.normal((1, length, width)) for length in lengths]
+
+
+@pytest.mark.parametrize("blocks", [(2, 2), (4, 3), (2, 5, 1), (3, 1, 4)])
+def test_draft_block_bases_match_each_request_drafted_alone(blocks):
+    config, model = _target()
+    draft = _drafter(config, 8)
+    count = len(blocks)
+    alone_caches = [draft.reset(model) for _ in blocks]
+    shared_caches = [draft.reset(model) for _ in blocks]
+    # A first round that reads some context, then one that reads the rows a
+    # round committed.
+    for seed, lengths in enumerate(((5, 3, 7)[:count], (1, 2, 3)[:count])):
+        hiddens = _target_hiddens(config, lengths, seed)
+        anchors = [11 + 5 * r + seed for r in range(count)]
+        alone = [
+            (
+                draft._logits(
+                    draft._hidden(
+                        draft._inputs(mx.array([anchor]), size - 1), hidden, cache
+                    )
+                )
+                if size > 1
+                else None
+            )
+            for anchor, hidden, cache, size in zip(
+                anchors, hiddens, alone_caches, blocks
+            )
+        ]
+        together = draft.draft_block_bases(anchors, hiddens, shared_caches, blocks)
+        for size, expected, got in zip(blocks, alone, together):
+            if size == 1:
+                assert got is None
+                continue
+            assert got.shape == expected.shape == (1, size - 1, config["vocab_size"])
+            np.testing.assert_allclose(
+                np.array(got), np.array(expected), rtol=1e-4, atol=1e-4
+            )
+    for expected, got in zip(alone_caches, shared_caches):
+        for a, b in zip(expected, got):
+            assert a.offset == b.offset
+            if a.keys is None:
+                assert b.keys is None
+                continue
+            np.testing.assert_allclose(
+                np.array(b.keys.astype(mx.float32)),
+                np.array(a.keys.astype(mx.float32)),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+
+def test_draft_block_takes_its_base_from_a_shared_forward():
+    config, model = _target()
+    draft = _drafter(config, 8)
+    hiddens = _target_hiddens(config, (4, 6), 3)
+    anchors, blocks = [9, 21], [4, 5]
+    alone = [
+        draft.draft_block(anchor, hidden, draft.reset(model), size, _greedy)
+        for anchor, hidden, size in zip(anchors, hiddens, blocks)
+    ]
+    caches = [draft.reset(model) for _ in blocks]
+    bases = draft.draft_block_bases(anchors, hiddens, caches, blocks)
+    calls = []
+    stock = draft._hidden
+    draft._hidden = lambda *args, **kwargs: calls.append(1) or stock(*args, **kwargs)
+    together = [
+        draft.draft_block(anchor, hidden, cache, size, _greedy, base=base)
+        for anchor, hidden, cache, size, base in zip(
+            anchors, hiddens, caches, blocks, bases
+        )
+    ]
+    assert not calls  # the stages are not run again
+    assert [t.tolist() for t in together] == [t.tolist() for t in alone]
